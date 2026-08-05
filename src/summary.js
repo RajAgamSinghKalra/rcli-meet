@@ -3,7 +3,7 @@
 // longer fits in the context window. Every SEGMENTS_PER_UPDATE finalized
 // segments, folds the new lines into the existing summary via one more LLM
 // call -- bounded output, so it stays cheap regardless of session length.
-const { serialize, visibleOutside, NO_THINK_DIRECTIVE } = require('./llm');
+const { serialize, visibleOutside, NO_THINK_DIRECTIVE, TRANSCRIPTION_CAVEAT } = require('./llm');
 
 const SEGMENTS_PER_UPDATE = Number(process.env.RCLI_MEET_SUMMARY_EVERY) || 8;
 const SUMMARY_MAX_TOKENS = Number(process.env.RCLI_MEET_SUMMARY_TOKENS) || 220;
@@ -11,6 +11,8 @@ const SUMMARY_TEMPERATURE = 0.2;
 
 function buildSummaryPrompt(existingSummary, newLines, disableThinking) {
   return `You maintain a running summary of a live meeting/call, for later Q&A. Update the summary to fold in the new transcript lines below. Keep it factual and concise -- a few sentences to a short paragraph, not a list of everything said. "[meeting]" lines are other people; "[you]" lines are the person this summary is for -- keep that distinction in the summary too (e.g. "you asked about X" vs "the team said Y").
+
+${TRANSCRIPTION_CAVEAT}
 
 Existing summary:
 ${existingSummary || '(none yet -- this is the first update)'}

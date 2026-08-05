@@ -14,6 +14,7 @@ const {
   supportsNoThink,
   serialize,
   NO_THINK_DIRECTIVE,
+  TRANSCRIPTION_CAVEAT,
   CONTEXT_TOKEN_BUDGET,
   ANSWER_MAX_TOKENS,
 } = require('../src/llm');
@@ -89,6 +90,17 @@ test('buildPrompt omits a partial section for a source with nothing in-flight', 
   const prompt = buildPrompt({ partials: { meeting: 'HELLO' }, question: 'q' });
   assert.ok(prompt.includes('[now] [meeting] HELLO'));
   assert.ok(!prompt.includes('[now] [you]'));
+});
+
+test('buildPrompt tells the model the transcript has ASR errors to interpret past', () => {
+  const prompt = buildPrompt({ question: 'q' });
+  assert.ok(prompt.includes(TRANSCRIPTION_CAVEAT));
+  assert.match(prompt, /similar-sounding/i);
+});
+
+test('buildSummaryPrompt also carries the transcription-error caveat', () => {
+  const prompt = buildSummaryPrompt('s', ['[meeting] hi'], false);
+  assert.ok(prompt.includes(TRANSCRIPTION_CAVEAT));
 });
 
 test('buildPrompt explains the meeting/you distinction to the model', () => {

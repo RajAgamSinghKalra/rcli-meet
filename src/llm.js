@@ -146,6 +146,14 @@ const SOURCE_EXPLAINER =
   '  [you]     -- what THE USER asking this question said into their own microphone\n' +
   'These are different people. Never attribute a [meeting] line to "you", or a [you] line to someone else in the meeting.';
 
+const TRANSCRIPTION_CAVEAT =
+  'This transcript comes from real-time automatic speech recognition, not a human transcriber, and WILL contain errors: ' +
+  'words swapped for similar-sounding ones (e.g. "THROCK" for "talk to", "MICASTING" for "mic testing"), missing punctuation, ' +
+  'no sentence casing, and garbled fragments where audio was unclear or overlapped. Read past these errors to the likely ' +
+  'intended meaning -- treat an odd word as a mis-heard version of a similar-sounding real word if context suggests one, ' +
+  'the way a human listening to a bad phone line would. If a line is too garbled to confidently interpret even with that, ' +
+  "ignore it rather than building an answer on it or quoting it as if it were exactly what was said.";
+
 /**
  * @param summary {string} rolling summary of the whole session so far (may
  *   lag the last few minutes -- that's what recentLines is for)
@@ -187,7 +195,9 @@ function buildPrompt({
 
   return `You are answering questions about a live meeting/call transcript. ${SOURCE_EXPLAINER}
 
-Use ONLY the information below. If the answer isn't in it, say so briefly. Be concise.
+${TRANSCRIPTION_CAVEAT}
+
+Use ONLY the information below (interpreting past transcription errors as instructed). If the answer isn't in it, say so briefly. Be concise.
 
 Summary of the meeting so far (may not include the last few minutes):
 ${summaryText || '(no summary yet)'}
@@ -317,6 +327,7 @@ module.exports = {
   supportsNoThink,
   serialize,
   NO_THINK_DIRECTIVE,
+  TRANSCRIPTION_CAVEAT,
   DEFAULT_LLM_PATH,
   DEFAULT_EMBEDDER_ID,
   CONTEXT_TOKEN_BUDGET,
