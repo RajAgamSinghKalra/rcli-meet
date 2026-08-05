@@ -1,0 +1,16 @@
+{
+  "name": "rcli-meet",
+  "version": "0.1.0",
+  "description": "Offline live-meeting captions + local-LLM Q&A over the rolling transcript. Runs on RunAnywhere's Vulkan-accelerated engine.",
+  "private": true,
+  "main": "src/main.js",
+  "bin": {
+    "rcli-meet": "src/main.js"
+  },
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "sherpa-onnx": "^1.12.11"
+  }
+}

@@ -1,0 +1,4 @@
+node_modules/
+models/*/
+transcripts/*.log
+*.tar.bz2
