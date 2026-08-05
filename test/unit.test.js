@@ -350,6 +350,76 @@ test('retrieval on an empty index returns an empty list', () => {
   assert.deepStrictEqual(r.topK('anything'), []);
 });
 
+// --- log-noise filter (quiet.js) ------------------------------------------
+
+const { createFilter } = require('../src/quiet');
+
+function collect() {
+  const out = [];
+  const f = createFilter((t) => out.push(t));
+  return { f, text: () => out.join('') };
+}
+
+test('filter drops [RAC] log lines and keeps everything else', () => {
+  const { f, text } = collect();
+  f.push('[RAC][INFO][LLM] loading | file=x.cpp:1\n');
+  f.push('[rcli-meet] STT ready.\n');
+  f.push('[RAC][WARN][Sherpa] rac_plugin_register failed: -811\n');
+  f.push('[00:00:05] THE DEADLINE IS FRIDAY\n');
+  assert.strictEqual(text(), '[rcli-meet] STT ready.\n[00:00:05] THE DEADLINE IS FRIDAY\n');
+});
+
+test('filter passes live caption text through IMMEDIATELY (no newline needed)', () => {
+  // Captions repaint in place with no trailing newline. Buffering them until a
+  // newline arrives would freeze the live display -- the whole point of the demo.
+  const { f, text } = collect();
+  f.push('\x1b[2K\x1b[1G… THE PROJECT');
+  assert.strictEqual(text(), '\x1b[2K\x1b[1G… THE PROJECT', 'must not be held back');
+  f.push(' DEADLINE');
+  assert.strictEqual(text(), '\x1b[2K\x1b[1G… THE PROJECT DEADLINE');
+});
+
+test('filter passes streaming answer tokens through immediately', () => {
+  const { f, text } = collect();
+  f.push('>> ');
+  f.push('They said ');
+  f.push('next Friday.');
+  assert.strictEqual(text(), '>> They said next Friday.');
+});
+
+test('filter holds a partial [RAC] line until it can be identified', () => {
+  const { f, text } = collect();
+  f.push('[RA'); // ambiguous prefix -- must wait
+  assert.strictEqual(text(), '');
+  f.push('C][INFO][X] noise\n');
+  assert.strictEqual(text(), '', 'resolved to a log line, so dropped');
+});
+
+test('filter does not mistake a caption timestamp for a log prefix', () => {
+  // "[00:" shares the leading "[" with "[RAC]" but is not a prefix of it.
+  const { f, text } = collect();
+  f.push('[00:');
+  assert.strictEqual(text(), '[00:', 'caption timestamps must stream immediately');
+});
+
+test('filter handles log and live text interleaved in one chunk', () => {
+  const { f, text } = collect();
+  f.push('[RAC][INFO][X] a\n[rcli-meet] b\n[RAC][INFO][X] c\n… live');
+  assert.strictEqual(text(), '[rcli-meet] b\n… live');
+});
+
+test('filter flush emits held non-log text', () => {
+  const { f, text } = collect();
+  f.push('[R');
+  f.flush();
+  assert.strictEqual(text(), '', 'a held log prefix stays dropped');
+
+  const b = collect();
+  b.f.push('trailing answer text');
+  b.f.flush();
+  assert.strictEqual(b.text(), 'trailing answer text');
+});
+
 // --- stt model validation -------------------------------------------------
 
 test('assertModelPresent throws an actionable error when files are missing', () => {

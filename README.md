@@ -106,7 +106,7 @@ a model with a larger context, raise both.
 ## Usage
 
 ```
-npm start -- --minutes 20
+node src/quiet.js --minutes 20
 ```
 
 Or copy `run.example.bat` to `run.bat`, fill in the paths for your machine,
@@ -120,6 +120,15 @@ the models per run, and `--help` lists everything.
 Captions that arrive while an answer is streaming are held back and printed
 after it -- repainting the caption line mid-answer emits terminal escape
 sequences that shred both.
+
+`src/quiet.js` is the recommended entry point (it's what `run.bat` uses): it
+runs `src/main.js` and filters the native addon's `[RAC]` log spam, which
+would otherwise bury the captions under ~50 lines per session. The addon logs
+at INFO no matter what the host requests -- `rac_init()` stores `cfg.log_level`
+in a variable used only by the core's internal logger, while the `RAC_LOG_*`
+macros check a separate `min_level` that defaults to INFO and never receives
+it, and the bindings don't expose `rac_logger_set_min_level`. Run
+`node src/main.js` directly if you want the unfiltered logs for debugging.
 
 ## Tests
 

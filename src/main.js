@@ -119,6 +119,11 @@ async function main() {
     input: process.stdin,
     output: process.stdout,
     prompt: '> ',
+    // Key interactivity off stdin, not stdout: when launched via quiet.js our
+    // stdout is a pipe (so readline would default terminal:false and stop
+    // echoing), but stdin is still the real console and the escape sequences
+    // pass through the filter to it unchanged.
+    terminal: !!process.stdin.isTTY,
   });
 
   let answering = false;

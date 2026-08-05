@@ -16,6 +16,7 @@ set "RCLI_MEET_LLM_PATH=qwen2.5-3b"
 set "RCLI_MEET_PYTHON=python"
 
 cd /d "%~dp0"
-node src\main.js --minutes 20 %* 2>NUL
+:: quiet.js filters the native addon's log spam; use src\main.js to see it.
+node src\quiet.js --minutes 20 %*
 
 pause
