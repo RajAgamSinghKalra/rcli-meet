@@ -11,6 +11,8 @@ const {
   buildPrompt,
   createThinkFilter,
   visibleOutside,
+  supportsNoThink,
+  NO_THINK_DIRECTIVE,
   CONTEXT_TOKEN_BUDGET,
   ANSWER_MAX_TOKENS,
 } = require('../src/llm');
@@ -107,6 +109,31 @@ test('context budget plus answer budget fits a 2048-token context', () => {
   );
 });
 
+// --- suppressing reasoning at the source ----------------------------------
+
+test('supportsNoThink detects Qwen models by id or path', () => {
+  assert.strictEqual(supportsNoThink('qwen2.5-3b'), true);
+  assert.strictEqual(supportsNoThink('D:/models/Qwen3-4B-Q4_K_M.gguf'), true);
+  assert.strictEqual(supportsNoThink('llama-3.2-3b'), false);
+  assert.strictEqual(supportsNoThink(undefined), false);
+});
+
+test('buildPrompt appends the no-think directive only when asked', () => {
+  const withNoThink = buildPrompt({ question: 'q', disableThinking: true });
+  assert.ok(withNoThink.trimEnd().endsWith(NO_THINK_DIRECTIVE));
+
+  const withThink = buildPrompt({ question: 'q', disableThinking: false });
+  assert.ok(!withThink.includes(NO_THINK_DIRECTIVE));
+  // Default must not silently change model behavior.
+  assert.ok(!buildPrompt({ question: 'q' }).includes(NO_THINK_DIRECTIVE));
+});
+
+test('the no-think directive costs almost nothing against the budget', () => {
+  const base = buildPrompt({ question: 'q', disableThinking: false });
+  const withDirective = buildPrompt({ question: 'q', disableThinking: true });
+  assert.ok(withDirective.length - base.length <= NO_THINK_DIRECTIVE.length + 2);
+});
+
 // --- reasoning-block (<think>) filtering ----------------------------------
 
 test('visibleOutside strips a complete think block', () => {
@@ -155,6 +182,21 @@ test('think filter reports empty visible text when the budget ran out mid-though
   const f = createThinkFilter();
   for (const c of ['<think>', 'reasoning that never finishes...']) f.push(c);
   assert.strictEqual(f.visibleText, '', 'caller must be able to detect "no answer produced"');
+});
+
+test('an empty think block (Qwen3 under /no_think) reports no real reasoning', () => {
+  // Qwen3 still emits <think>\n\n</think> when reasoning is disabled; that
+  // must not flash a "thinking..." indicator at the user.
+  const { thinkingChars } = visibleOutside('<think>\n\n</think>Next Friday.');
+  assert.ok(thinkingChars <= 8, `empty block should have ~no content, got ${thinkingChars}`);
+  assert.strictEqual(visibleOutside('<think>\n\n</think>Next Friday.').text, 'Next Friday.');
+});
+
+test('a substantive think block reports real reasoning content', () => {
+  const { thinkingChars } = visibleOutside(
+    '<think>Okay, the user is asking about the deadline, let me check.</think>Friday.'
+  );
+  assert.ok(thinkingChars > 8, 'real reasoning must be distinguishable from an empty block');
 });
 
 test('think filter handles a plain (non-reasoning) model stream', () => {

@@ -67,6 +67,27 @@ tar -xjf models/zipformer.tar.bz2 -C models/
 | `RCLI_MEET_STT_MODEL_DIR` | `models/sherpa-onnx-streaming-zipformer-en-2023-06-26` | Streaming Zipformer model directory |
 | `RCLI_MEET_CONTEXT_TOKENS` | `1200` | Transcript tokens allowed into the prompt (see Context budget) |
 | `RCLI_MEET_ANSWER_TOKENS` | `400` | Token budget for the answer, including any reasoning block |
+| `RCLI_MEET_THINKING` | unset (off for Qwen) | Set to `on` to re-enable chain-of-thought (see below) |
+
+### Chain-of-thought is suppressed by default on Qwen models
+
+Reasoning models spend most of their token budget inside `<think>` before
+answering -- enough that the answer can never arrive. commons exposes a
+`disable_thinking` option for this, but the Electron bindings don't surface it,
+so rcli-meet appends Qwen3's prompt-level `/no_think` directive (the same
+approach the SDK's own `Playground/android-use-agent` uses).
+
+Measured on Qwen3-4B-Q4_K_M with a clean 3-line transcript:
+
+| | Tokens generated | Latency | Answer |
+|---|---|---|---|
+| Thinking on | 140 | 1558 ms | correct |
+| `/no_think` (default) | **12** | **251 ms** | correct |
+
+Same answer, 5.8x faster, and no risk of the budget being eaten before the
+answer starts. Set `RCLI_MEET_THINKING=on` to compare. The `<think>` filter
+stays active regardless, since R1-style distillations reason by training and
+ignore the directive.
 
 ### Context budget
 
@@ -120,9 +141,10 @@ ranking and its failure handling, and model-path validation.
 - Endpoint detection needs a trailing silence gap to finalize an utterance;
   a question asked in the first ~1-1.5s after speech resumes (right after
   the previous endpoint reset) may land before any partial has appeared yet.
-- Reasoning models (Qwen3 etc.) spend part of the answer budget inside
-  `<think>`. That block is hidden from the terminal, but it still consumes
-  tokens -- if you see "used its whole budget reasoning", raise
-  `RCLI_MEET_ANSWER_TOKENS` or use a non-reasoning model.
+- Chain-of-thought is suppressed on Qwen models (see above). On other
+  reasoning models the `<think>` block is hidden but still consumes budget --
+  if you see "used its whole budget reasoning", raise
+  `RCLI_MEET_ANSWER_TOKENS`. R1-style distillations reason by training and
+  cannot be switched off at the prompt level at all.
 - Answer quality is whatever the chosen local LLM gives you -- reliable for
   "what did they say the deadline was", not for deep synthesis.

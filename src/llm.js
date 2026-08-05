@@ -16,6 +16,25 @@ const DEFAULT_EMBEDDER_ID = process.env.RCLI_MEET_EMBEDDER_ID || 'minilm';
 const ANSWER_MAX_TOKENS = Number(process.env.RCLI_MEET_ANSWER_TOKENS) || 400;
 const ANSWER_TEMPERATURE = 0.3;
 
+// Better than paying for reasoning and hiding it: suppress it at the source.
+// commons has a disable_thinking option, but the Electron bindings never
+// expose it (GenerateOptions has no such field), so apply Qwen3's
+// prompt-level soft switch -- the same approach the SDK's own
+// Playground/android-use-agent uses, where it cut output from 381 tokens to
+// 19-24. Set RCLI_MEET_THINKING=on to keep chain-of-thought enabled.
+const NO_THINK_DIRECTIVE = '/no_think';
+const THINKING_FORCED_ON = /^(1|on|true|yes)$/i.test(process.env.RCLI_MEET_THINKING || '');
+
+/**
+ * Whether this model honors the /no_think directive. It's a Qwen3 chat-template
+ * feature; R1-style distillations reason because of the distillation itself and
+ * ignore it (see the SDK's own ASSESSMENT.md), which is why the streaming
+ * <think> filter stays in place as a safety net either way.
+ */
+function supportsNoThink(modelId) {
+  return /qwen/i.test(String(modelId || ''));
+}
+
 // The transcript grows without bound, but the model's context does not: the
 // llama.cpp backend computes `available = n_ctx - prompt_tokens - reserved`
 // and (a) silently clamps max_tokens to it, then (b) hard-fails "Prompt too
@@ -82,10 +101,13 @@ async function loadEngine({ llmPath = DEFAULT_LLM_PATH, embedderId = DEFAULT_EMB
     throw err;
   }
 
+  const disableThinking = !THINKING_FORCED_ON && supportsNoThink(llmPath);
+
   let shutDown = false;
   return {
     llm,
     embedder,
+    disableThinking,
     shutdown() {
       if (shutDown) return;
       shutDown = true;
@@ -105,7 +127,13 @@ async function loadEngine({ llmPath = DEFAULT_LLM_PATH, embedderId = DEFAULT_EMB
  * @param partial {string} the in-flight, not-yet-finalized utterance (may be '')
  * @param question {string}
  */
-function buildPrompt({ recentLines = [], retrievedLines = [], partial = '', question }) {
+function buildPrompt({
+  recentLines = [],
+  retrievedLines = [],
+  partial = '',
+  question,
+  disableThinking = false,
+}) {
   const retrievedFit = fitLinesFromEnd(retrievedLines, CONTEXT_CHAR_BUDGET * RETRIEVED_CHAR_SHARE);
   // Whatever the retrieved section didn't use goes to the recency window.
   const recentBudget = CONTEXT_CHAR_BUDGET - retrievedFit.text.length;
@@ -129,11 +157,14 @@ Recent transcript:${truncationNote}
 ${recentText || '(none yet)'}
 
 Question: ${question}
-Answer:`;
+Answer:${disableThinking ? `\n${NO_THINK_DIRECTIVE}` : ''}`;
 }
 
 const THINK_OPEN = '<think>';
 const THINK_CLOSE = '</think>';
+// Whitespace-only <think> blocks (what Qwen3 emits under /no_think) are not
+// real reasoning and shouldn't trigger a user-visible indicator.
+const EMPTY_THINK_TOLERANCE = 8;
 
 /** Length of the longest suffix of `s` that is a proper prefix of `tag`. */
 function partialTagTail(s, tag) {
@@ -153,6 +184,7 @@ function visibleOutside(raw) {
   let out = '';
   let i = 0;
   let thinking = false;
+  let thinkingChars = 0;
   while (i < raw.length) {
     const open = raw.indexOf(THINK_OPEN, i);
     if (open === -1) {
@@ -162,14 +194,17 @@ function visibleOutside(raw) {
     out += raw.slice(i, open);
     const close = raw.indexOf(THINK_CLOSE, open + THINK_OPEN.length);
     if (close === -1) {
-      thinking = true; // still inside the block; hide everything after it
+      // Still inside the block; hide everything after it.
+      thinking = true;
+      thinkingChars += raw.length - (open + THINK_OPEN.length);
       break;
     }
+    thinkingChars += close - (open + THINK_OPEN.length);
     i = close + THINK_CLOSE.length;
   }
   const hold = partialTagTail(out, THINK_OPEN);
   if (hold) out = out.slice(0, out.length - hold);
-  return { text: out, thinking };
+  return { text: out, thinking, thinkingChars };
 }
 
 /**
@@ -182,13 +217,13 @@ function createThinkFilter() {
   return {
     push(token) {
       raw += token;
-      const { text, thinking } = visibleOutside(raw);
+      const { text, thinking, thinkingChars } = visibleOutside(raw);
       let delta = '';
       if (text.length > emitted) {
         delta = text.slice(emitted);
         emitted = text.length;
       }
-      return { delta, thinking };
+      return { delta, thinking, thinkingChars };
     },
     get visibleText() {
       return visibleOutside(raw).text;
@@ -214,8 +249,10 @@ async function askQuestion(llm, promptCtx, onToken, onThinking = () => {}) {
     maxTokens: ANSWER_MAX_TOKENS,
     temperature: ANSWER_TEMPERATURE,
   })) {
-    const { delta, thinking } = filter.push(token);
-    if (thinking && !announcedThinking) {
+    const { delta, thinking, thinkingChars } = filter.push(token);
+    // Qwen3 under /no_think still emits an EMPTY <think></think> block, so
+    // don't flash a "thinking" indicator unless it's actually reasoning.
+    if (thinking && thinkingChars > EMPTY_THINK_TOLERANCE && !announcedThinking) {
       announcedThinking = true;
       onThinking();
     }
@@ -232,6 +269,8 @@ module.exports = {
   fitLinesFromEnd,
   createThinkFilter,
   visibleOutside,
+  supportsNoThink,
+  NO_THINK_DIRECTIVE,
   DEFAULT_LLM_PATH,
   DEFAULT_EMBEDDER_ID,
   CONTEXT_TOKEN_BUDGET,

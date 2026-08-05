@@ -105,7 +105,10 @@ async function main() {
 
   console.log('[rcli-meet] loading local engine (LLM + embedder, Vulkan)...');
   const engine = await loadEngine({ llmPath: opts.llmPath, embedderId: opts.embedderId });
-  console.log(`[rcli-meet] LLM ready: ${opts.llmPath}`);
+  console.log(
+    `[rcli-meet] LLM ready: ${opts.llmPath}` +
+      (engine.disableThinking ? ' (chain-of-thought suppressed)' : '')
+  );
   console.log(`[rcli-meet] embedder ready: ${opts.embedderId}`);
 
   console.log('[rcli-meet] loading streaming STT model...');
@@ -233,6 +236,7 @@ async function main() {
             retrievedLines: retrieved.map((r) => r.line),
             partial: currentPartial,
             question,
+            disableThinking: engine.disableThinking,
           },
           (text) => {
             clearPlaceholder();
