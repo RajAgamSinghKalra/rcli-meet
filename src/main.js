@@ -134,6 +134,9 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('[rcli-meet] fatal error:', err);
+  // stdout, not stderr/console.error -- run.bat redirects stderr to NUL to
+  // silence the native addon's log spam, so real errors must go to stdout
+  // to stay visible.
+  console.log('[rcli-meet] fatal error:', err);
   process.exit(1);
 });

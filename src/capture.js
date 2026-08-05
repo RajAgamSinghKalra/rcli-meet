@@ -33,14 +33,16 @@ function startCapture(onSamples) {
   });
 
   proc.stderr.on('data', (chunk) => {
-    process.stderr.write(`[capture] ${chunk}`);
+    // stdout, not stderr -- run.bat redirects stderr to NUL to silence the
+    // native addon's log spam, so keep our own diagnostics visible.
+    process.stdout.write(`[capture] ${chunk}`);
   });
 
   proc.on('exit', (code, signal) => {
     if (code !== null && code !== 0) {
-      console.error(`[capture] audio capture process exited with code ${code}`);
+      console.log(`[capture] audio capture process exited with code ${code}`);
     } else if (signal) {
-      console.error(`[capture] audio capture process killed by ${signal}`);
+      console.log(`[capture] audio capture process killed by ${signal}`);
     }
   });
 

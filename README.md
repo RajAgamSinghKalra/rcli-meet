@@ -71,6 +71,9 @@ tar -xjf models/zipformer.tar.bz2 -C models/
 npm start -- --minutes 20
 ```
 
+Or copy `run.example.bat` to `run.bat`, fill in the paths for your machine,
+and double-click it each time.
+
 Captions stream live to the terminal. Type a question and press Enter to get
 a streamed answer grounded in the transcript; `/quit` or Ctrl+C exits
 cleanly. `--llm <catalog-id-or-path>` and `--embedder <catalog-id>` override
