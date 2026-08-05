@@ -103,6 +103,14 @@ test('buildSummaryPrompt also carries the transcription-error caveat', () => {
   assert.ok(prompt.includes(TRANSCRIPTION_CAVEAT));
 });
 
+test('buildPrompt teaches reply adjacency and overlap handling', () => {
+  const prompt = buildPrompt({ question: 'q' });
+  assert.match(prompt, /chronological order/i);
+  assert.match(prompt, /direct reply/i);
+  assert.match(prompt, /overlapping speech.*talked over/i);
+  assert.match(prompt, /simultaneously/i);
+});
+
 test('buildPrompt explains the meeting/you distinction to the model', () => {
   const prompt = buildPrompt({ question: 'q' });
   assert.match(prompt, /\[meeting\][\s\S]*other people/i);
@@ -302,6 +310,53 @@ test('transcript sorts by time across two independently-arriving sources', () =>
 
   const ordered = t.all().map((s) => s.text);
   assert.deepStrictEqual(ordered, ['said first', 'said in between', 'said second']);
+});
+
+// --- cross-talk / overlap detection ----------------------------------------
+
+const { withOverlapMarkers, OVERLAP_SUFFIX } = require('../src/transcript');
+
+function seg(source, startElapsedMs, elapsedMs, text = source) {
+  return { source, startElapsedMs, elapsedMs, text, line: `[00:00:00] [${source}] ${text}` };
+}
+
+test('withOverlapMarkers flags genuinely simultaneous cross-source speech', () => {
+  // "you" talks 1000-3000ms, "meeting" talks 2000-4000ms -- ranges overlap.
+  const marked = withOverlapMarkers([seg('you', 1000, 3000), seg('meeting', 2000, 4000)]);
+  assert.ok(marked[0].line.endsWith(OVERLAP_SUFFIX));
+  assert.ok(marked[1].line.endsWith(OVERLAP_SUFFIX));
+});
+
+test('withOverlapMarkers does not flag sequential (non-overlapping) turns', () => {
+  const marked = withOverlapMarkers([seg('meeting', 0, 1000), seg('you', 1500, 2000)]);
+  assert.ok(!marked[0].line.endsWith(OVERLAP_SUFFIX));
+  assert.ok(!marked[1].line.endsWith(OVERLAP_SUFFIX));
+});
+
+test('withOverlapMarkers never flags two segments from the SAME source', () => {
+  // One mic, one loopback stream -- a source can't overlap with itself.
+  const marked = withOverlapMarkers([seg('you', 0, 3000), seg('you', 1000, 2000)]);
+  assert.ok(!marked[0].line.endsWith(OVERLAP_SUFFIX));
+  assert.ok(!marked[1].line.endsWith(OVERLAP_SUFFIX));
+});
+
+test('transcript.add records a real start time for overlap detection', () => {
+  const t = createTranscript(tmpDir());
+  const s = t.add('hi', 'meeting', 42);
+  assert.strictEqual(s.startElapsedMs, 42);
+});
+
+test('transcript.lastMinutes marks overlap using neighbors outside the window too', () => {
+  const t = createTranscript(tmpDir());
+  const old = t.add('old overlapping', 'meeting', 0);
+  old.elapsedMs = -10 * 60 * 1000; // outside a 5-minute window
+  old.startElapsedMs = -10 * 60 * 1000 - 500;
+  const recent = t.add('recent', 'you', old.elapsedMs - 100); // overlaps `old`
+  recent.startElapsedMs = old.elapsedMs - 100;
+
+  const windowed = t.lastMinutes(5);
+  assert.strictEqual(windowed.length, 1, 'the old segment itself should be excluded');
+  assert.ok(windowed[0].line.endsWith(OVERLAP_SUFFIX), 'but still marked from its out-of-window neighbor');
 });
 
 test('transcript.close() flushes before resolving (log is not truncated)', async () => {

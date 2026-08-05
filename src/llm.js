@@ -43,7 +43,9 @@ function supportsNoThink(modelId) {
 // So cap what we put in the prompt, keeping the MOST RECENT lines.
 // ~3.5 chars/token is a conservative estimate for English ASR output.
 const CHARS_PER_TOKEN = 3.5;
-const DEFAULT_CONTEXT_TOKENS = 1200; // leaves room for answer + scaffolding at n_ctx=2048
+// Fixed prompt scaffolding (instructions, section headers) is now ~600
+// tokens on its own -- leave real margin, not just room for the answer.
+const DEFAULT_CONTEXT_TOKENS = 900;
 const CONTEXT_TOKEN_BUDGET = Number(process.env.RCLI_MEET_CONTEXT_TOKENS) || DEFAULT_CONTEXT_TOKENS;
 const CONTEXT_CHAR_BUDGET = Math.floor(CONTEXT_TOKEN_BUDGET * CHARS_PER_TOKEN);
 // Split the budget: retrieved "earlier moments" are usually a few short lines,
@@ -144,7 +146,14 @@ const SOURCE_EXPLAINER =
   'The transcript has two tagged sources:\n' +
   '  [meeting] -- what OTHER people in the meeting/call said\n' +
   '  [you]     -- what THE USER asking this question said into their own microphone\n' +
-  'These are different people. Never attribute a [meeting] line to "you", or a [you] line to someone else in the meeting.';
+  'These are different people. Never attribute a [meeting] line to "you", or a [you] line to someone else in the meeting.\n' +
+  'Lines are in real chronological order (by when each finished being said), across both sources. A [you] line shortly ' +
+  'after a [meeting] line is often a direct reply to it, and vice versa -- use that ordering to work out what was being ' +
+  'responded to, who asked what, and how a conversation unfolded, the way you would from a chat log with two participants.\n' +
+  'A line marked "(overlapping speech -- talked over)" happened at the SAME TIME as a nearby line from the other source ' +
+  '-- both people were speaking simultaneously, not one after another. For those, do not assume a strict question-then-' +
+  'answer order, and treat their content as extra uncertain, since overlapping audio is exactly when speech recognition ' +
+  'is least reliable.';
 
 const TRANSCRIPTION_CAVEAT =
   'This transcript comes from real-time automatic speech recognition, not a human transcriber, and WILL contain errors: ' +

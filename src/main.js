@@ -176,6 +176,11 @@ async function main() {
   // detection needs a trailing silence gap, so whatever was *just* said is
   // often still "partial" when a question comes in about it.
   const partials = { meeting: '', you: '' };
+  // When each source's CURRENT (not yet finalized) utterance began, so a
+  // finalized segment can carry a real [start, end] range -- needed to
+  // detect genuine cross-talk (both sources active at once) rather than just
+  // sequential turns. Reset to null on finalize.
+  const utteranceStart = { meeting: null, you: null };
 
   /**
    * clearLine(0) + cursorTo(0) only reset the CURRENT terminal row. If the
@@ -193,6 +198,7 @@ async function main() {
   /** Wires partial/final handling for one source's STT stream. */
   function wireStream(sttStream, source) {
     sttStream.on('partial', (text) => {
+      if (utteranceStart[source] == null) utteranceStart[source] = transcript.elapsedNow();
       partials[source] = text;
       if (answering) return; // tracked for context, just not repainted
       readline.clearLine(process.stdout, 0);
@@ -201,9 +207,11 @@ async function main() {
     });
 
     sttStream.on('final', (text) => {
+      const startedAt = utteranceStart[source] ?? transcript.elapsedNow();
+      utteranceStart[source] = null;
       partials[source] = '';
       // Always record, even mid-answer -- only the rendering is deferred.
-      const seg = transcript.add(text, source);
+      const seg = transcript.add(text, source, startedAt);
       retrieval.add(seg);
       summarizer.addSegment(seg);
       summarizer.maybeUpdate();
