@@ -1,5 +1,10 @@
 // Streaming speech-to-text over the official sherpa-onnx package (prebuilt,
 // real incremental decoding -- not RunAnywhere's own batch-only STT).
+//
+// The model loads ONCE via createSTTEngine(); each audio source (meeting
+// loopback, your mic) gets its own independent createStream() -- separate
+// decode state over the same weights, so two simultaneous speakers don't
+// share (and corrupt) a single recognizer's endpoint/decode state.
 const fs = require('fs');
 const path = require('path');
 const { EventEmitter } = require('events');
@@ -37,7 +42,8 @@ function assertModelPresent(modelDir) {
   );
 }
 
-function createStreamingSTT(modelDir) {
+/** Load the streaming model once. Returns {createStream, close}. */
+function createSTTEngine(modelDir) {
   assertModelPresent(modelDir);
 
   const recognizer = sherpa_onnx.createOnlineRecognizer({
@@ -61,44 +67,64 @@ function createStreamingSTT(modelDir) {
     rule3MinUtteranceLength: 20,
   });
 
-  const stream = recognizer.createStream();
-  const emitter = new EventEmitter();
-  let lastPartial = '';
-  let closed = false;
+  let engineClosed = false;
+  const openStreams = new Set();
 
-  emitter.sampleRate = SAMPLE_RATE;
+  /** Independent decode state over the shared model. */
+  function createStream() {
+    if (engineClosed) throw new Error('createStream: STT engine is already closed');
 
-  /** @param samples {Float32Array} mono, 16kHz, range [-1, 1] */
-  emitter.feed = function feed(samples) {
-    if (closed) return;
-    stream.acceptWaveform(SAMPLE_RATE, samples);
-    while (recognizer.isReady(stream)) {
-      recognizer.decode(stream);
-    }
+    const stream = recognizer.createStream();
+    const emitter = new EventEmitter();
+    let lastPartial = '';
+    let streamClosed = false;
 
-    const result = recognizer.getResult(stream);
-    const text = (result.text || '').trim();
-    if (text && text !== lastPartial) {
-      lastPartial = text;
-      emitter.emit('partial', text);
-    }
+    emitter.sampleRate = SAMPLE_RATE;
 
-    if (recognizer.isEndpoint(stream)) {
-      if (text) emitter.emit('final', text);
-      lastPartial = '';
-      recognizer.reset(stream);
-    }
+    /** @param samples {Float32Array} mono, 16kHz, range [-1, 1] */
+    emitter.feed = function feed(samples) {
+      if (streamClosed || engineClosed) return;
+      stream.acceptWaveform(SAMPLE_RATE, samples);
+      while (recognizer.isReady(stream)) {
+        recognizer.decode(stream);
+      }
+
+      const result = recognizer.getResult(stream);
+      const text = (result.text || '').trim();
+      if (text && text !== lastPartial) {
+        lastPartial = text;
+        emitter.emit('partial', text);
+      }
+
+      if (recognizer.isEndpoint(stream)) {
+        if (text) emitter.emit('final', text);
+        lastPartial = '';
+        recognizer.reset(stream);
+      }
+    };
+
+    // Idempotent: freeing the same native handle twice can crash the process.
+    emitter.close = function close() {
+      if (streamClosed) return;
+      streamClosed = true;
+      openStreams.delete(emitter);
+      stream.free();
+    };
+
+    openStreams.add(emitter);
+    return emitter;
+  }
+
+  return {
+    createStream,
+    /** Closes every open stream, then frees the shared model. Idempotent. */
+    close() {
+      if (engineClosed) return;
+      engineClosed = true;
+      for (const s of Array.from(openStreams)) s.close();
+      recognizer.free();
+    },
   };
-
-  // Idempotent: freeing the same native handle twice can crash the process.
-  emitter.close = function close() {
-    if (closed) return;
-    closed = true;
-    stream.free();
-    recognizer.free();
-  };
-
-  return emitter;
 }
 
-module.exports = { createStreamingSTT, assertModelPresent, SAMPLE_RATE, MODEL_FILES };
+module.exports = { createSTTEngine, assertModelPresent, SAMPLE_RATE, MODEL_FILES };

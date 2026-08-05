@@ -2,14 +2,16 @@
 // rcli-meet: offline live-meeting captions + local-LLM Q&A over the rolling
 // transcript. CLI only, no UI. Everything runs locally: RunAnywhere's
 // Vulkan-accelerated LLM/embedder engine + the official sherpa-onnx streaming
-// recognizer + a WASAPI loopback capture helper. Nothing leaves the machine.
+// recognizer + WASAPI loopback (the meeting) and mic (you) capture helpers.
+// Nothing leaves the machine.
 const path = require('path');
 const readline = require('readline');
 
 const { startCapture } = require('./capture');
-const { createStreamingSTT, assertModelPresent } = require('./stt');
+const { createSTTEngine, assertModelPresent } = require('./stt');
 const { createTranscript } = require('./transcript');
 const { createRetrieval } = require('./retrieval');
+const { createSummarizer } = require('./summary');
 const {
   loadEngine,
   askQuestion,
@@ -23,6 +25,7 @@ const MODEL_DIR =
   path.join(__dirname, '..', 'models', 'sherpa-onnx-streaming-zipformer-en-2023-06-26');
 const TRANSCRIPTS_DIR = path.join(__dirname, '..', 'transcripts');
 const RETRIEVAL_TOP_K = 5;
+const SOURCES = ['meeting', 'you'];
 
 const USAGE = `rcli-meet -- offline live captions + local-LLM Q&A over the rolling transcript
 
@@ -32,25 +35,29 @@ Options:
   --minutes <n>        Size of the recency window fed to the model (default: 20)
   --llm <id|path>      RunAnywhere LLM catalog id or local GGUF path
   --embedder <id>      RunAnywhere embedder catalog id
+  --no-mic             Don't capture your own microphone, meeting audio only
   -h, --help           Show this help
 
 Environment:
   RCLI_MEET_SDK_DIST       Path to your @runanywhere/electron "dist" directory
   RCLI_MEET_LLM_PATH       Default LLM (catalog id or GGUF path)
   RCLI_MEET_EMBEDDER_ID    Default embedder catalog id
-  RCLI_MEET_PYTHON         Python interpreter for the loopback capture helper
+  RCLI_MEET_PYTHON         Python interpreter for the audio capture helper
   RCLI_MEET_STT_MODEL_DIR  Streaming Zipformer model directory
   RCLI_MEET_CONTEXT_TOKENS Transcript tokens to fit in the prompt (default: 1200)
+  RCLI_MEET_SUMMARY_EVERY  Finalized segments between summary updates (default: 8)
+  RCLI_MEET_SUMMARY_TOKENS Token budget for each summary update (default: 220)
 
-In-session: type a question and press Enter; /quit or Ctrl+C to exit.`;
+In-session: type a question and press Enter; /quit or Ctrl+C to exit.
+
+Note: without headphones, your microphone may also pick up the meeting audio
+itself (speaker bleed), which would mislabel meeting speech as "you" said it.`;
 
 class UsageError extends Error {}
 
 function parseArgs(argv) {
-  const opts = { minutes: 20, llmPath: DEFAULT_LLM_PATH, embedderId: DEFAULT_EMBEDDER_ID };
+  const opts = { minutes: 20, llmPath: DEFAULT_LLM_PATH, embedderId: DEFAULT_EMBEDDER_ID, mic: true };
 
-  // Every flag below needs a value; bail out clearly rather than silently
-  // consuming the next flag (or undefined) as one.
   const takeValue = (flag, i) => {
     const value = argv[i + 1];
     if (value === undefined || value.startsWith('--')) {
@@ -76,6 +83,8 @@ function parseArgs(argv) {
       opts.llmPath = takeValue(arg, i++);
     } else if (arg === '--embedder') {
       opts.embedderId = takeValue(arg, i++);
+    } else if (arg === '--no-mic') {
+      opts.mic = false;
     } else {
       throw new UsageError(`unknown option "${arg}"`);
     }
@@ -112,8 +121,16 @@ async function main() {
   console.log(`[rcli-meet] embedder ready: ${opts.embedderId}`);
 
   console.log('[rcli-meet] loading streaming STT model...');
-  const stt = createStreamingSTT(MODEL_DIR);
+  const stt = createSTTEngine(MODEL_DIR);
   console.log('[rcli-meet] STT ready.');
+  if (opts.mic) {
+    console.log(
+      '[rcli-meet] capturing meeting audio + your mic. Without headphones, your mic may ' +
+        'also pick up the meeting itself (speaker bleed) and mislabel it as "you".'
+    );
+  } else {
+    console.log('[rcli-meet] capturing meeting audio only (--no-mic).');
+  }
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -149,43 +166,64 @@ async function main() {
   const transcript = createTranscript(TRANSCRIPTS_DIR, { onError: notify });
   console.log(`[rcli-meet] session log: ${transcript.logPath}`);
   const retrieval = createRetrieval(engine.embedder, { onError: notify });
-
-  let currentPartial = '';
-
-  stt.on('partial', (text) => {
-    currentPartial = text;
-    if (answering) return; // tracked for context, just not repainted
-    readline.clearLine(process.stdout, 0);
-    readline.cursorTo(process.stdout, 0);
-    process.stdout.write(`… ${text}`);
+  const summarizer = createSummarizer({
+    llm: engine.llm,
+    disableThinking: engine.disableThinking,
+    onError: notify,
   });
 
-  stt.on('final', (text) => {
-    currentPartial = '';
-    // Always record, even mid-answer -- only the rendering is deferred.
-    const seg = transcript.add(text);
-    retrieval.add(seg);
-    if (answering) deferredLines.push(seg.line);
-    else printLine(seg.line);
-  });
+  // One in-flight (not-yet-finalized) utterance per source -- endpoint
+  // detection needs a trailing silence gap, so whatever was *just* said is
+  // often still "partial" when a question comes in about it.
+  const partials = { meeting: '', you: '' };
 
-  let fatal = null;
-  const capture = startCapture(
-    (samples) => {
-      // A throw here would escape through the child-process 'data' event as an
-      // uncaught exception and kill the session.
-      try {
-        stt.feed(samples);
-      } catch (err) {
-        notify(`transcription error: ${err.message}`);
+  /** Wires partial/final handling for one source's STT stream. */
+  function wireStream(sttStream, source) {
+    sttStream.on('partial', (text) => {
+      partials[source] = text;
+      if (answering) return; // tracked for context, just not repainted
+      readline.clearLine(process.stdout, 0);
+      readline.cursorTo(process.stdout, 0);
+      process.stdout.write(`… [${source}] ${text}`);
+    });
+
+    sttStream.on('final', (text) => {
+      partials[source] = '';
+      // Always record, even mid-answer -- only the rendering is deferred.
+      const seg = transcript.add(text, source);
+      retrieval.add(seg);
+      summarizer.addSegment(seg);
+      summarizer.maybeUpdate();
+      if (answering) deferredLines.push(seg.line);
+      else printLine(seg.line);
+    });
+  }
+
+  const sttStreams = {};
+  const captures = {};
+  for (const source of SOURCES) {
+    if (source === 'you' && !opts.mic) continue;
+    const sttStream = stt.createStream();
+    wireStream(sttStream, source);
+    sttStreams[source] = sttStream;
+
+    captures[source] = startCapture(
+      source === 'meeting' ? 'loopback' : 'mic',
+      (samples) => {
+        // A throw here would escape through the child-process 'data' event as
+        // an uncaught exception and kill the session.
+        try {
+          sttStream.feed(samples);
+        } catch (err) {
+          notify(`${source} transcription error: ${err.message}`);
+        }
+      },
+      (message) => {
+        notify(message);
+        notify(`${source} captions have stopped; other sources keep working.`);
       }
-    },
-    (message) => {
-      fatal = message;
-      notify(message);
-      notify('captions have stopped; you can still ask about what was already transcribed.');
-    }
-  );
+    );
+  }
 
   rl.on('line', (line) => {
     void handleLine(line);
@@ -220,9 +258,6 @@ async function main() {
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
       process.stdout.write('>> ');
-
-      // Reasoning models emit a <think> block first. Show a placeholder so the
-      // wait isn't silent, then replace it with the real answer.
       let placeholderShown = false;
       let gotAnswerText = false;
       const clearPlaceholder = () => {
@@ -237,9 +272,10 @@ async function main() {
         const { answer } = await askQuestion(
           engine.llm,
           {
+            summary: summarizer.summary,
             recentLines,
             retrievedLines: retrieved.map((r) => r.line),
-            partial: currentPartial,
+            partials,
             question,
             disableThinking: engine.disableThinking,
           },
@@ -278,7 +314,8 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     process.stdout.write('\n[rcli-meet] shutting down...\n');
-    capture.stop();
+    for (const source of Object.keys(captures)) captures[source].stop();
+    for (const source of Object.keys(sttStreams)) sttStreams[source].close();
     stt.close();
     // Must await: logStream.end() is async, and exiting first truncates the
     // tail of the session log.

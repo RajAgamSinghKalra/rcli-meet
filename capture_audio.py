@@ -1,16 +1,20 @@
-"""WASAPI loopback capture helper for rcli-meet.
+"""Audio capture helper for rcli-meet.
 
-Captures whatever the default output device is currently playing (no virtual
-audio driver needed -- WASAPI loopback is native to Windows), downmixes to
-mono, resamples to 16kHz, and streams raw float32 PCM samples to stdout for
-the Node process to consume.
+Two sources, selected by --source:
+  loopback  WASAPI loopback on the default speaker -- what OTHERS say in the
+            meeting (no virtual audio driver needed, native to Windows).
+  mic       The default microphone -- what YOU say.
+
+Downmixes to mono, resamples to 16kHz, and streams raw float32 PCM to stdout.
+One frame = SAMPLES_PER_BLOCK * 4 bytes.
 
 The recorder runs on its own thread feeding a queue, because the consumer
 (ONNX speech recognition) decodes synchronously and periodically stalls its
-end of the pipe. When stdout blocked, the WASAPI recorder stopped being
-drained and dropped audio -- surfacing as "data discontinuity in recording"
-and silently losing words from the transcript.
+end of the pipe. When stdout blocked, the recorder stopped being drained and
+dropped audio -- surfacing as "data discontinuity in recording" and silently
+losing words from the transcript.
 """
+import argparse
 import queue
 import sys
 import threading
@@ -24,6 +28,16 @@ SAMPLES_PER_BLOCK = 1600  # 100ms per block
 MAX_QUEUED_BLOCKS = 300
 
 
+def get_device(source):
+    if source == "loopback":
+        speaker = sc.default_speaker()
+        return sc.get_microphone(id=str(speaker.name), include_loopback=True), speaker.name
+    elif source == "mic":
+        mic = sc.default_microphone()
+        return mic, mic.name
+    raise ValueError(f"unknown source: {source}")
+
+
 def record_into(q, mic, stop):
     with mic.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=SAMPLES_PER_BLOCK) as rec:
         while not stop.is_set():
@@ -32,8 +46,8 @@ def record_into(q, mic, stop):
                 q.put_nowait(block)
             except queue.Full:
                 # Consumer is badly behind. Drop the oldest block rather than
-                # stalling the recorder, which is what causes WASAPI
-                # discontinuities in the first place.
+                # stalling the recorder, which is what causes discontinuities
+                # in the first place.
                 try:
                     q.get_nowait()
                     q.put_nowait(block)
@@ -42,13 +56,16 @@ def record_into(q, mic, stop):
 
 
 def main():
-    speaker = sc.default_speaker()
-    mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-    print(f"[capture] loopback on: {speaker.name}", file=sys.stderr, flush=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", choices=["loopback", "mic"], required=True)
+    args = parser.parse_args()
+
+    device, name = get_device(args.source)
+    print(f"[capture:{args.source}] on: {name}", file=sys.stderr, flush=True)
 
     q = queue.Queue(maxsize=MAX_QUEUED_BLOCKS)
     stop = threading.Event()
-    thread = threading.Thread(target=record_into, args=(q, mic, stop), daemon=True)
+    thread = threading.Thread(target=record_into, args=(q, device, stop), daemon=True)
     thread.start()
 
     stdout = sys.stdout.buffer

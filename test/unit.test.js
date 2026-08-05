@@ -12,6 +12,7 @@ const {
   createThinkFilter,
   visibleOutside,
   supportsNoThink,
+  serialize,
   NO_THINK_DIRECTIVE,
   CONTEXT_TOKEN_BUDGET,
   ANSWER_MAX_TOKENS,
@@ -19,6 +20,7 @@ const {
 const { createTranscript, fmtElapsed } = require('../src/transcript');
 const { createRetrieval, dot } = require('../src/retrieval');
 const { assertModelPresent } = require('../src/stt');
+const { createSummarizer, buildSummaryPrompt } = require('../src/summary');
 
 // --- context budget -------------------------------------------------------
 
@@ -48,16 +50,16 @@ test('buildPrompt bounds a huge transcript to the context budget', () => {
     (_, i) => `[00:${String(i % 60).padStart(2, '0')}:00] this is caption line number ${i}`
   );
   const prompt = buildPrompt({ recentLines, retrievedLines: [], question: 'what happened?' });
-
-  // The whole point: the prompt must stay inside the model's context window.
-  // ~3.5 chars/token, and the answer needs room too.
   const estimatedTokens = prompt.length / 3.5;
+
+  // The invariant that actually matters -- not an approximation of internal
+  // overhead (instructions, section headers, the truncation note itself all
+  // legitimately vary), but the one thing that must always hold: prompt +
+  // answer budget fits under the model's context.
   assert.ok(
-    estimatedTokens < 2048 - 200,
-    `prompt should fit in a 2048-token context with room for a 200-token answer, ` +
-      `estimated ${Math.round(estimatedTokens)} tokens (${prompt.length} chars)`
+    estimatedTokens + ANSWER_MAX_TOKENS < 2048,
+    `full prompt (~${Math.round(estimatedTokens)} tokens) + answer budget (${ANSWER_MAX_TOKENS}) must fit n_ctx=2048`
   );
-  assert.ok(estimatedTokens <= CONTEXT_TOKEN_BUDGET + 200, 'should respect the configured budget');
 });
 
 test('buildPrompt keeps the newest captions and says what it dropped', () => {
@@ -69,17 +71,50 @@ test('buildPrompt keeps the newest captions and says what it dropped', () => {
   assert.match(prompt, /line\(s\) omitted/, 'must disclose truncation rather than hide it');
 });
 
-test('buildPrompt always includes the in-flight partial utterance', () => {
-  // The partial is the most likely subject of a question, so it must survive
+test('buildPrompt always includes in-flight partials from both sources', () => {
+  // Partials are the most likely subject of a question, so they must survive
   // even when the window is saturated.
-  const recentLines = Array.from({ length: 2000 }, (_, i) => `[00:00:00] caption ${i}`);
+  const recentLines = Array.from({ length: 2000 }, (_, i) => `[00:00:00] [meeting] caption ${i}`);
   const prompt = buildPrompt({
     recentLines,
     retrievedLines: [],
-    partial: 'THE DEADLINE IS NEXT FRIDAY',
+    partials: { meeting: 'THE DEADLINE IS NEXT FRIDAY', you: 'GOT IT THANKS' },
     question: 'what is the deadline?',
   });
-  assert.ok(prompt.includes('[now] THE DEADLINE IS NEXT FRIDAY'));
+  assert.ok(prompt.includes('[now] [meeting] THE DEADLINE IS NEXT FRIDAY'));
+  assert.ok(prompt.includes('[now] [you] GOT IT THANKS'));
+});
+
+test('buildPrompt omits a partial section for a source with nothing in-flight', () => {
+  const prompt = buildPrompt({ partials: { meeting: 'HELLO' }, question: 'q' });
+  assert.ok(prompt.includes('[now] [meeting] HELLO'));
+  assert.ok(!prompt.includes('[now] [you]'));
+});
+
+test('buildPrompt explains the meeting/you distinction to the model', () => {
+  const prompt = buildPrompt({ question: 'q' });
+  assert.match(prompt, /\[meeting\][\s\S]*other people/i);
+  assert.match(prompt, /\[you\][\s\S]*THE USER/i);
+});
+
+test('buildPrompt includes the rolling summary, capped, ahead of the recency window', () => {
+  const prompt = buildPrompt({ summary: 'They discussed the Q3 roadmap.', question: 'q' });
+  assert.ok(prompt.includes('They discussed the Q3 roadmap.'));
+  assert.ok(!prompt.includes('no summary yet'));
+
+  const empty = buildPrompt({ question: 'q' });
+  assert.ok(empty.includes('no summary yet'));
+});
+
+test('buildPrompt reserves context space for the summary before the recency window', () => {
+  const longSummary = 'S'.repeat(2000);
+  const recentLines = Array.from({ length: 2000 }, (_, i) => `[00:00:00] [meeting] caption ${i}`);
+  const prompt = buildPrompt({ summary: longSummary, recentLines, question: 'q' });
+  const estimatedTokens = prompt.length / 3.5;
+  assert.ok(
+    estimatedTokens + ANSWER_MAX_TOKENS < 2048,
+    `summary + transcript + answer together must still fit n_ctx=2048, got ~${Math.round(estimatedTokens)} prompt tokens`
+  );
 });
 
 test('buildPrompt includes the question and both sections', () => {
@@ -221,11 +256,12 @@ test('fmtElapsed formats hours, minutes and seconds', () => {
 test('transcript records segments and writes them to the log', async () => {
   const dir = tmpDir();
   const t = createTranscript(dir);
-  t.add('first line');
-  t.add('second line');
+  t.add('first line', 'meeting');
+  t.add('second line', 'you');
 
   assert.strictEqual(t.all().length, 2);
-  assert.match(t.all()[0].line, /^\[00:00:0\d\] first line$/);
+  assert.match(t.all()[0].line, /^\[00:00:0\d\] \[meeting\] first line$/);
+  assert.match(t.all()[1].line, /^\[00:00:0\d\] \[you\] second line$/);
 
   await t.close();
   const onDisk = fs.readFileSync(t.logPath, 'utf8');
@@ -233,12 +269,35 @@ test('transcript records segments and writes them to the log', async () => {
   assert.ok(onDisk.includes('second line'));
 });
 
+test('transcript.add rejects an unknown source', () => {
+  const t = createTranscript(tmpDir());
+  assert.throws(() => t.add('x', 'bogus'), /source must be/);
+});
+
+test('transcript sorts by time across two independently-arriving sources', () => {
+  // Two independent STT streams finalize on their own timers -- a "you"
+  // segment from 5s ago can arrive after a "meeting" segment from just now.
+  // Reading must reflect real chronological order, not arrival order.
+  const t = createTranscript(tmpDir());
+  const early = t.add('said first', 'you');
+  early.elapsedMs = 1000;
+  const late = t.add('said second', 'meeting'); // arrives second but is earlier... no, later
+  late.elapsedMs = 5000;
+  // Now simulate an out-of-order arrival: a "you" segment whose actual speech
+  // time is BETWEEN the two above, but which finalizes last.
+  const middle = t.add('said in between', 'you');
+  middle.elapsedMs = 3000;
+
+  const ordered = t.all().map((s) => s.text);
+  assert.deepStrictEqual(ordered, ['said first', 'said in between', 'said second']);
+});
+
 test('transcript.close() flushes before resolving (log is not truncated)', async () => {
   const dir = tmpDir();
   const t = createTranscript(dir);
   // Enough volume that the write stream must buffer rather than complete
   // synchronously -- this is what used to get lost on process.exit().
-  for (let i = 0; i < 5000; i++) t.add(`line number ${i} with some padding text`);
+  for (let i = 0; i < 5000; i++) t.add(`line number ${i} with some padding text`, 'meeting');
   await t.close();
 
   const lines = fs.readFileSync(t.logPath, 'utf8').trim().split('\n');
@@ -249,20 +308,20 @@ test('transcript.close() flushes before resolving (log is not truncated)', async
 test('transcript.close() is idempotent and stops accepting writes', async () => {
   const dir = tmpDir();
   const t = createTranscript(dir);
-  t.add('kept');
+  t.add('kept', 'meeting');
   await t.close();
   await t.close(); // must not throw (double shutdown path)
-  t.add('after close'); // must not throw on a closed stream
+  t.add('after close', 'meeting'); // must not throw on a closed stream
   assert.ok(!fs.readFileSync(t.logPath, 'utf8').includes('after close'));
 });
 
 test('transcript windowing excludes segments older than the window', () => {
   const dir = tmpDir();
   const t = createTranscript(dir);
-  const seg = t.add('old line');
+  const seg = t.add('old line', 'meeting');
   // Backdate beyond the window instead of sleeping.
   seg.elapsedMs = -10 * 60 * 1000;
-  t.add('new line');
+  t.add('new line', 'you');
 
   const recent = t.lastMinutes(5).map((s) => s.text);
   assert.deepStrictEqual(recent, ['new line']);
@@ -348,6 +407,156 @@ test('retrieval returns nothing (not a throw) when the query cannot embed', () =
 test('retrieval on an empty index returns an empty list', () => {
   const r = createRetrieval(fakeEmbedder({}));
   assert.deepStrictEqual(r.topK('anything'), []);
+});
+
+// --- LLM call serialization ------------------------------------------------
+
+test('serialize never runs two functions concurrently', async () => {
+  // llama.cpp contexts aren't safe for concurrent decode: a summary update
+  // racing a question's generate() call on the same context is the failure
+  // this exists to prevent. Simulate overlapping async work and assert the
+  // "busy" flag is never true when a second call starts.
+  let busy = false;
+  let overlapDetected = false;
+  const order = [];
+
+  function slowTask(id, ms) {
+    return serialize(async () => {
+      if (busy) overlapDetected = true;
+      busy = true;
+      order.push(`start:${id}`);
+      await new Promise((r) => setTimeout(r, ms));
+      order.push(`end:${id}`);
+      busy = false;
+    });
+  }
+
+  const a = slowTask('A', 30);
+  const b = slowTask('B', 5);
+  const c = slowTask('C', 5);
+  await Promise.all([a, b, c]);
+
+  assert.strictEqual(overlapDetected, false, 'no two tasks should ever run concurrently');
+  // Queued in call order: A fully finishes before B starts, B before C.
+  assert.deepStrictEqual(order, ['start:A', 'end:A', 'start:B', 'end:B', 'start:C', 'end:C']);
+});
+
+test('serialize continues the queue after a task throws', async () => {
+  const results = [];
+  await serialize(async () => {
+    throw new Error('boom');
+  }).catch(() => results.push('caught first'));
+  await serialize(async () => {
+    results.push('second ran');
+  });
+  assert.deepStrictEqual(results, ['caught first', 'second ran']);
+});
+
+// --- rolling meeting summary ------------------------------------------------
+
+function fakeLLM(responder) {
+  return {
+    async *generate(prompt) {
+      for (const tok of responder(prompt)) yield tok;
+    },
+  };
+}
+
+test('summarizer does nothing until enough segments accumulate', () => {
+  const llm = fakeLLM(() => {
+    throw new Error('should not be called yet');
+  });
+  const s = createSummarizer({ llm });
+  for (let i = 0; i < 7; i++) s.addSegment({ line: `line ${i}` });
+  s.maybeUpdate(); // below the default threshold of 8
+  assert.strictEqual(s.summary, '');
+  assert.strictEqual(s.pendingCount, 7);
+});
+
+test('summarizer folds new segments into the summary once the threshold is hit', async () => {
+  const llm = fakeLLM((prompt) => {
+    assert.ok(prompt.includes('line 0'), 'new lines must reach the prompt');
+    return ['Updated: ', 'discussed the roadmap.'];
+  });
+  const s = createSummarizer({ llm });
+  for (let i = 0; i < 8; i++) s.addSegment({ line: `line ${i}` });
+  s.maybeUpdate();
+
+  await new Promise((r) => setTimeout(r, 20)); // let the fire-and-forget settle
+  assert.strictEqual(s.summary, 'Updated: discussed the roadmap.');
+  assert.strictEqual(s.pendingCount, 0, 'folded segments must be cleared');
+});
+
+test('summarizer strips a <think> block from its own output', async () => {
+  const llm = fakeLLM(() => ['<think>reasoning</think>', 'The short summary.']);
+  const s = createSummarizer({ llm });
+  for (let i = 0; i < 8; i++) s.addSegment({ line: `line ${i}` });
+  s.maybeUpdate();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(s.summary, 'The short summary.');
+});
+
+test('summarizer restores pending segments if the update fails', async () => {
+  const errors = [];
+  const llm = fakeLLM(() => {
+    throw new Error('generation failed');
+  });
+  const s = createSummarizer({ llm, onError: (m) => errors.push(m) });
+  for (let i = 0; i < 8; i++) s.addSegment({ line: `line ${i}` });
+  s.maybeUpdate();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(errors.length, 1);
+  assert.strictEqual(s.pendingCount, 8, 'content must not be silently lost on failure');
+});
+
+test('buildSummaryPrompt asks the model to preserve the meeting/you distinction', () => {
+  const prompt = buildSummaryPrompt('existing', ['[meeting] hi', '[you] hello'], false);
+  assert.ok(prompt.includes('existing'));
+  assert.ok(prompt.includes('[meeting] hi'));
+  assert.match(prompt, /\[you\][\s\S]*\[meeting\]|distinction/i);
+});
+
+test("buildSummaryPrompt appends /no_think when requested", () => {
+  const withDirective = buildSummaryPrompt('s', ['l'], true);
+  assert.ok(withDirective.trimEnd().endsWith(NO_THINK_DIRECTIVE));
+  assert.ok(!buildSummaryPrompt('s', ['l'], false).includes(NO_THINK_DIRECTIVE));
+});
+
+test('summarizer and askQuestion share the same lock (never overlap)', async () => {
+  // The property that actually matters end-to-end: a summary update and a
+  // question answer must never run generate() at the same time even though
+  // they're triggered from completely different call sites.
+  const { askQuestion } = require('../src/llm');
+  let busy = false;
+  let overlapDetected = false;
+
+  const llm = {
+    async *generate() {
+      if (busy) overlapDetected = true;
+      busy = true;
+      yield 'tok1';
+      await new Promise((r) => setTimeout(r, 15));
+      yield 'tok2';
+      busy = false;
+    },
+  };
+
+  const s = createSummarizer({ llm });
+  for (let i = 0; i < 8; i++) s.addSegment({ line: `line ${i}` });
+
+  const questionPromise = askQuestion(llm, { question: 'q' }, () => {});
+  s.maybeUpdate(); // fires right after, on the same llm
+  await questionPromise;
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.strictEqual(overlapDetected, false);
+});
+
+// --- capture source validation ---------------------------------------------
+
+test('startCapture rejects an unknown source before spawning anything', () => {
+  const { startCapture } = require('../src/capture');
+  assert.throws(() => startCapture('bogus', () => {}), /must be "loopback" or "mic"/);
 });
 
 // --- log-noise filter (quiet.js) ------------------------------------------

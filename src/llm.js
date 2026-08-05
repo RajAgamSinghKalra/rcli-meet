@@ -60,11 +60,30 @@ function fitLinesFromEnd(lines, budget) {
   let used = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
     const cost = lines[i].length + 1; // +1 for the newline
-    if (used + cost > budget) break;
+    if (used + cost > Math.max(0, budget)) break;
     kept.unshift(lines[i]);
     used += cost;
   }
   return { text: kept.join('\n'), dropped: lines.length - kept.length };
+}
+
+// The rolling summary is generated with its own small token cap (see
+// summary.js), so this is a defensive ceiling, not the normal path.
+const SUMMARY_CHAR_CAP = Math.floor(300 * CHARS_PER_TOKEN);
+
+// llama.cpp contexts are not safe for concurrent decode: two overlapping
+// generate() calls on the same loaded model (one for a question, one for a
+// background summary update) would race on the same KV cache. Route every
+// generate() call -- from askQuestion AND from the summarizer -- through
+// this so only one ever runs at a time, regardless of call site.
+let llmLock = Promise.resolve();
+function serialize(fn) {
+  const run = llmLock.then(fn, fn);
+  llmLock = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
 }
 
 async function loadEngine({ llmPath = DEFAULT_LLM_PATH, embedderId = DEFAULT_EMBEDDER_ID } = {}) {
@@ -121,34 +140,57 @@ async function loadEngine({ llmPath = DEFAULT_LLM_PATH, embedderId = DEFAULT_EMB
   };
 }
 
+const SOURCE_EXPLAINER =
+  'The transcript has two tagged sources:\n' +
+  '  [meeting] -- what OTHER people in the meeting/call said\n' +
+  '  [you]     -- what THE USER asking this question said into their own microphone\n' +
+  'These are different people. Never attribute a [meeting] line to "you", or a [you] line to someone else in the meeting.';
+
 /**
- * @param recentLines {string[]} caption lines in the recency window, oldest first
+ * @param summary {string} rolling summary of the whole session so far (may
+ *   lag the last few minutes -- that's what recentLines is for)
+ * @param recentLines {string[]} caption lines in the recency window, oldest first,
+ *   each already tagged "[meeting]" or "[you]" (see transcript.js)
  * @param retrievedLines {string[]} similarity-matched lines from earlier in the session
- * @param partial {string} the in-flight, not-yet-finalized utterance (may be '')
+ * @param partials {{meeting?: string, you?: string}} in-flight, not-yet-finalized
+ *   utterances per source (endpoint detection needs a trailing silence gap, so
+ *   whatever was *just* said is often still "partial" when a question arrives)
  * @param question {string}
  */
 function buildPrompt({
+  summary = '',
   recentLines = [],
   retrievedLines = [],
-  partial = '',
+  partials = {},
   question,
   disableThinking = false,
 }) {
-  const retrievedFit = fitLinesFromEnd(retrievedLines, CONTEXT_CHAR_BUDGET * RETRIEVED_CHAR_SHARE);
-  // Whatever the retrieved section didn't use goes to the recency window.
-  const recentBudget = CONTEXT_CHAR_BUDGET - retrievedFit.text.length;
-  const partialLine = partial ? `[now] ${partial}` : '';
+  const summaryText = summary.slice(0, SUMMARY_CHAR_CAP);
+  let remaining = CONTEXT_CHAR_BUDGET - summaryText.length;
+
+  const retrievedFit = fitLinesFromEnd(retrievedLines, remaining * RETRIEVED_CHAR_SHARE);
+  remaining -= retrievedFit.text.length;
+
+  const partialLines = ['meeting', 'you']
+    .filter((src) => partials[src])
+    .map((src) => `[now] [${src}] ${partials[src]}`);
+  const partialsBlock = partialLines.join('\n');
   // The in-flight utterance is the most likely thing a question is about, so
   // it gets reserved space ahead of older finalized lines.
-  const recentFit = fitLinesFromEnd(recentLines, recentBudget - partialLine.length);
+  const recentFit = fitLinesFromEnd(recentLines, remaining - partialsBlock.length);
 
-  const recentText = [recentFit.text, partialLine].filter(Boolean).join('\n');
+  const recentText = [recentFit.text, partialsBlock].filter(Boolean).join('\n');
   const truncationNote =
     recentFit.dropped > 0
-      ? `\n(note: ${recentFit.dropped} earlier line(s) omitted to fit the context window)`
+      ? `\n(note: ${recentFit.dropped} earlier line(s) omitted to fit the context window -- see the summary above for older context)`
       : '';
 
-  return `You are answering questions about a live meeting/talk transcript. Use ONLY the transcript excerpts below. If the answer isn't in them, say so briefly. Be concise.
+  return `You are answering questions about a live meeting/call transcript. ${SOURCE_EXPLAINER}
+
+Use ONLY the information below. If the answer isn't in it, say so briefly. Be concise.
+
+Summary of the meeting so far (may not include the last few minutes):
+${summaryText || '(no summary yet)'}
 
 Relevant earlier moments:
 ${retrievedFit.text || '(none)'}
@@ -242,24 +284,27 @@ function createThinkFilter() {
  */
 async function askQuestion(llm, promptCtx, onToken, onThinking = () => {}) {
   const prompt = buildPrompt(promptCtx);
-  const filter = createThinkFilter();
-  let announcedThinking = false;
 
-  for await (const token of llm.generate(prompt, {
-    maxTokens: ANSWER_MAX_TOKENS,
-    temperature: ANSWER_TEMPERATURE,
-  })) {
-    const { delta, thinking, thinkingChars } = filter.push(token);
-    // Qwen3 under /no_think still emits an EMPTY <think></think> block, so
-    // don't flash a "thinking" indicator unless it's actually reasoning.
-    if (thinking && thinkingChars > EMPTY_THINK_TOLERANCE && !announcedThinking) {
-      announcedThinking = true;
-      onThinking();
+  return serialize(async () => {
+    const filter = createThinkFilter();
+    let announcedThinking = false;
+
+    for await (const token of llm.generate(prompt, {
+      maxTokens: ANSWER_MAX_TOKENS,
+      temperature: ANSWER_TEMPERATURE,
+    })) {
+      const { delta, thinking, thinkingChars } = filter.push(token);
+      // Qwen3 under /no_think still emits an EMPTY <think></think> block, so
+      // don't flash a "thinking" indicator unless it's actually reasoning.
+      if (thinking && thinkingChars > EMPTY_THINK_TOLERANCE && !announcedThinking) {
+        announcedThinking = true;
+        onThinking();
+      }
+      if (delta) onToken(delta);
     }
-    if (delta) onToken(delta);
-  }
 
-  return { answer: filter.visibleText.trim(), raw: filter.rawText };
+    return { answer: filter.visibleText.trim(), raw: filter.rawText };
+  });
 }
 
 module.exports = {
@@ -270,9 +315,11 @@ module.exports = {
   createThinkFilter,
   visibleOutside,
   supportsNoThink,
+  serialize,
   NO_THINK_DIRECTIVE,
   DEFAULT_LLM_PATH,
   DEFAULT_EMBEDDER_ID,
   CONTEXT_TOKEN_BUDGET,
   ANSWER_MAX_TOKENS,
+  CHARS_PER_TOKEN,
 };
