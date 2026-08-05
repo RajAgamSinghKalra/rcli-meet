@@ -644,9 +644,9 @@ test('assertModelPresent throws an actionable error when files are missing', () 
 test('assertModelPresent passes when every file exists', () => {
   const dir = tmpDir();
   for (const f of [
-    'encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx',
+    'encoder-epoch-99-avg-1-chunk-16-left-128.onnx',
     'decoder-epoch-99-avg-1-chunk-16-left-128.onnx',
-    'joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx',
+    'joiner-epoch-99-avg-1-chunk-16-left-128.onnx',
     'tokens.txt',
   ]) {
     fs.writeFileSync(path.join(dir, f), 'x');

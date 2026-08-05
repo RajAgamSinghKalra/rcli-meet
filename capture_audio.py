@@ -61,7 +61,7 @@ def main():
     args = parser.parse_args()
 
     device, name = get_device(args.source)
-    print(f"[capture:{args.source}] on: {name}", file=sys.stderr, flush=True)
+    print(f"on: {name}", file=sys.stderr, flush=True)
 
     q = queue.Queue(maxsize=MAX_QUEUED_BLOCKS)
     stop = threading.Event()

@@ -12,10 +12,13 @@ const sherpa_onnx = require('sherpa-onnx');
 
 const SAMPLE_RATE = 16000;
 
+// Full precision, not int8: meaningfully more accurate (word-level errors,
+// not just noise) at a CPU cost this box has headroom for -- STT is CPU-only
+// regardless, and the GPU is already fully dedicated to the LLM.
 const MODEL_FILES = {
-  encoder: 'encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx',
+  encoder: 'encoder-epoch-99-avg-1-chunk-16-left-128.onnx',
   decoder: 'decoder-epoch-99-avg-1-chunk-16-left-128.onnx',
-  joiner: 'joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx',
+  joiner: 'joiner-epoch-99-avg-1-chunk-16-left-128.onnx',
   tokens: 'tokens.txt',
 };
 

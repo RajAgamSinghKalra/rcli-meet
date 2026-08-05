@@ -177,6 +177,19 @@ async function main() {
   // often still "partial" when a question comes in about it.
   const partials = { meeting: '', you: '' };
 
+  /**
+   * clearLine(0) + cursorTo(0) only reset the CURRENT terminal row. If the
+   * previous write wrapped onto a second row (long caption, narrow window),
+   * those escapes don't touch that leftover row -- each update then stacks a
+   * new copy below the last instead of replacing it. Truncating to fit one
+   * row (keeping the tail -- most recent words matter most) makes wrapping
+   * impossible, which is a simpler fix than tracking multi-row cursor state.
+   */
+  function fitOneRow(text) {
+    const width = (process.stdout.columns || 80) - 1;
+    return text.length <= width ? text : '…' + text.slice(-(width - 1));
+  }
+
   /** Wires partial/final handling for one source's STT stream. */
   function wireStream(sttStream, source) {
     sttStream.on('partial', (text) => {
@@ -184,7 +197,7 @@ async function main() {
       if (answering) return; // tracked for context, just not repainted
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
-      process.stdout.write(`… [${source}] ${text}`);
+      process.stdout.write(fitOneRow(`… [${source}] ${text}`));
     });
 
     sttStream.on('final', (text) => {
