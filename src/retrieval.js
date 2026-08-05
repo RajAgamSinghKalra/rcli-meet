@@ -8,21 +8,54 @@ function dot(a, b) {
   return sum;
 }
 
-function createRetrieval(embedder) {
+/**
+ * @param embedder RunAnywhere embedder (embed() returns an L2-normalized Float32Array)
+ * @param onError {(message: string) => void} non-fatal embed failures
+ */
+function createRetrieval(embedder, { onError = () => {} } = {}) {
   const items = [];
 
   return {
-    /** @param segment {{line: string, text: string, elapsedMs: number}} */
+    /**
+     * @param segment {{line: string, text: string, elapsedMs: number}}
+     * @returns {boolean} whether the segment was indexed
+     */
     add(segment) {
-      const vec = embedder.embed(segment.text);
-      items.push({ ...segment, vec });
+      // embed() runs native code; a failure here used to propagate out of the
+      // STT 'final' handler and kill the session. Losing one segment from the
+      // similarity index is far better -- it's still in the transcript and
+      // still reachable through the recency window.
+      try {
+        const vec = embedder.embed(segment.text);
+        items.push({ ...segment, vec });
+        return true;
+      } catch (err) {
+        onError(`could not index a transcript segment for search: ${err.message}`);
+        return false;
+      }
     },
 
-    /** Top-k segments by cosine similarity to `query` (embeddings are already L2-normalized). */
-    topK(query, k = 5) {
+    get size() {
+      return items.length;
+    },
+
+    /**
+     * Top-k segments by cosine similarity to `query` (embeddings are already
+     * L2-normalized, so a dot product IS the cosine similarity).
+     * @param exclude {Set<string>} segment lines to omit (e.g. already shown
+     *   verbatim in the recency window) so the prompt doesn't repeat itself.
+     */
+    topK(query, k = 5, exclude = new Set()) {
       if (items.length === 0) return [];
-      const qvec = embedder.embed(query);
+      let qvec;
+      try {
+        qvec = embedder.embed(query);
+      } catch (err) {
+        onError(`could not embed the question for search: ${err.message}`);
+        return [];
+      }
       return items
+        .filter((item) => !exclude.has(item.line))
         .map((item) => ({ item, score: dot(qvec, item.vec) }))
         .sort((a, b) => b.score - a.score)
         .slice(0, k)
@@ -31,4 +64,4 @@ function createRetrieval(embedder) {
   };
 }
 
-module.exports = { createRetrieval };
+module.exports = { createRetrieval, dot };

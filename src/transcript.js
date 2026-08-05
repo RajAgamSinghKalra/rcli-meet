@@ -11,13 +11,17 @@ function fmtElapsed(ms) {
   return `${h}:${m}:${s}`;
 }
 
-function createTranscript(sessionDir) {
+function createTranscript(sessionDir, { onError = () => {} } = {}) {
   fs.mkdirSync(sessionDir, { recursive: true });
   const startedAt = Date.now();
   const logPath = path.join(sessionDir, `session-${startedAt}.log`);
   const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+  // Without a listener, a write failure (disk full, permissions) emits an
+  // unhandled 'error' event and takes the whole process down mid-session.
+  logStream.on('error', (err) => onError(`session log write failed: ${err.message}`));
 
   const segments = [];
+  let closed = false;
 
   return {
     logPath,
@@ -26,9 +30,10 @@ function createTranscript(sessionDir) {
     add(text) {
       const elapsedMs = Date.now() - startedAt;
       const line = `[${fmtElapsed(elapsedMs)}] ${text}`;
-      segments.push({ elapsedMs, text, line });
-      logStream.write(line + '\n');
-      return { elapsedMs, text, line };
+      const segment = { elapsedMs, text, line };
+      segments.push(segment);
+      if (!closed) logStream.write(line + '\n');
+      return segment;
     },
 
     all() {
@@ -48,10 +53,19 @@ function createTranscript(sessionDir) {
         .join('\n');
     },
 
+    /**
+     * Resolves once buffered lines are actually on disk. Callers MUST await
+     * this before process.exit(), or the tail of the session log (the demo's
+     * ground-truth artifact) gets truncated.
+     */
     close() {
-      logStream.end();
+      if (closed) return Promise.resolve();
+      closed = true;
+      return new Promise((resolve) => {
+        logStream.end(() => resolve());
+      });
     },
   };
 }
 
-module.exports = { createTranscript };
+module.exports = { createTranscript, fmtElapsed };

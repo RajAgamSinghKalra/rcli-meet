@@ -64,6 +64,23 @@ tar -xjf models/zipformer.tar.bz2 -C models/
 | `RCLI_MEET_LLM_PATH` | `qwen2.5-3b` (catalog id, auto-downloads) | Any RunAnywhere LLM catalog id or local GGUF path |
 | `RCLI_MEET_EMBEDDER_ID` | `minilm` | RunAnywhere embedder catalog id |
 | `RCLI_MEET_PYTHON` | `python` | Python interpreter to run `capture_loopback.py` -- override if `python`/`py` on PATH resolves to the Windows Store alias stub instead of a real interpreter |
+| `RCLI_MEET_STT_MODEL_DIR` | `models/sherpa-onnx-streaming-zipformer-en-2023-06-26` | Streaming Zipformer model directory |
+| `RCLI_MEET_CONTEXT_TOKENS` | `1200` | Transcript tokens allowed into the prompt (see Context budget) |
+| `RCLI_MEET_ANSWER_TOKENS` | `400` | Token budget for the answer, including any reasoning block |
+
+### Context budget
+
+The transcript grows without bound; the model's context does not. llama.cpp
+computes `available = n_ctx - prompt_tokens - reserved`, silently clamps
+`max_tokens` to it, then hard-fails `Prompt too long` once it goes
+non-positive. With a typical `n_ctx=2048` fit, feeding an unbounded 20-minute
+transcript blows past that within ~10 minutes of speech.
+
+So the prompt is capped at `RCLI_MEET_CONTEXT_TOKENS`, keeping the **most
+recent** caption lines plus the in-flight utterance, and it says how many
+lines it dropped rather than hiding the truncation. `CONTEXT_TOKENS +
+ANSWER_TOKENS` must stay comfortably under your model's `n_ctx` -- if you run
+a model with a larger context, raise both.
 
 ## Usage
 
@@ -77,14 +94,35 @@ and double-click it each time.
 Captions stream live to the terminal. Type a question and press Enter to get
 a streamed answer grounded in the transcript; `/quit` or Ctrl+C exits
 cleanly. `--llm <catalog-id-or-path>` and `--embedder <catalog-id>` override
-the models per run.
+the models per run, and `--help` lists everything.
+
+Captions that arrive while an answer is streaming are held back and printed
+after it -- repainting the caption line mid-answer emits terminal escape
+sequences that shred both.
+
+## Tests
+
+```
+npm test
+```
+
+Covers the pure logic with no models or audio required: context budgeting,
+reasoning-block filtering, transcript windowing and flush-on-close, retrieval
+ranking and its failure handling, and model-path validation.
 
 ## Honest notes
 
 - Streaming STT is CPU-only (sherpa-onnx has no GPU runtime for this model
   family) -- only the LLM leg is GPU-accelerated.
+- **Use audio with clear speech and no music bed.** A music track in the
+  loopback path produces confident nonsense captions, which then poison the
+  answers.
 - Endpoint detection needs a trailing silence gap to finalize an utterance;
   a question asked in the first ~1-1.5s after speech resumes (right after
   the previous endpoint reset) may land before any partial has appeared yet.
+- Reasoning models (Qwen3 etc.) spend part of the answer budget inside
+  `<think>`. That block is hidden from the terminal, but it still consumes
+  tokens -- if you see "used its whole budget reasoning", raise
+  `RCLI_MEET_ANSWER_TOKENS` or use a non-reasoning model.
 - Answer quality is whatever the chosen local LLM gives you -- reliable for
   "what did they say the deadline was", not for deep synthesis.
