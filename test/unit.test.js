@@ -812,3 +812,71 @@ test('loadSession throws a clear error for an unknown session name', () => {
 test('addFileToSession rejects a nonexistent source file', () => {
   assert.throws(() => addFileToSession(tmpDir(), '/no/such/file.txt'), /no such file/);
 });
+
+// --- energy VAD segmenter (sttWhisper.js) ----------------------------------
+
+const { createEnergyVad, SAMPLE_RATE: WHISPER_SAMPLE_RATE } = require('../src/sttWhisper');
+
+function tone(ms, amplitude) {
+  return new Float32Array(Math.round((WHISPER_SAMPLE_RATE * ms) / 1000)).fill(amplitude);
+}
+
+test('energy VAD stays silent through quiet audio -- no speech start, no utterance', () => {
+  const starts = [];
+  const utterances = [];
+  const vad = createEnergyVad({ onSpeechStart: () => starts.push(1), onUtterance: (s) => utterances.push(s) });
+  for (let i = 0; i < 10; i++) vad.feed(tone(100, 0.001)); // well under the threshold
+  assert.strictEqual(starts.length, 0);
+  assert.strictEqual(utterances.length, 0);
+});
+
+test('energy VAD fires onSpeechStart once loud audio begins, onUtterance after enough trailing silence', () => {
+  const starts = [];
+  const utterances = [];
+  const vad = createEnergyVad({ onSpeechStart: () => starts.push(1), onUtterance: (s) => utterances.push(s) });
+
+  for (let i = 0; i < 3; i++) vad.feed(tone(100, 0.5)); // 300ms loud
+  assert.strictEqual(starts.length, 1, 'should fire exactly once, not per loud chunk');
+  assert.strictEqual(utterances.length, 0, 'not finalized yet -- no silence gap seen');
+
+  for (let i = 0; i < 8; i++) vad.feed(tone(100, 0.001)); // 800ms fed; finalize fires the instant 700ms is crossed
+  assert.strictEqual(utterances.length, 1);
+  // 300ms loud + exactly the 700ms silence threshold (finalize fires the instant it's crossed,
+  // so the 8th fed chunk arrives after reset and is dropped, not buffered).
+  assert.strictEqual(utterances[0].length, tone(300, 0).length + tone(700, 0).length, 'buffer includes the trailing silence up to the threshold, not just the loud part');
+});
+
+test('energy VAD does not finalize on a brief pause shorter than the silence gap', () => {
+  const utterances = [];
+  const vad = createEnergyVad({ onSpeechStart: () => {}, onUtterance: (s) => utterances.push(s) });
+  vad.feed(tone(200, 0.5));
+  vad.feed(tone(200, 0.001)); // 200ms pause -- well under the 700ms gap
+  vad.feed(tone(200, 0.5)); // resumes as the SAME utterance
+  assert.strictEqual(utterances.length, 0);
+  vad.flush();
+  assert.strictEqual(utterances.length, 1);
+  assert.ok(utterances[0].length > tone(500, 0).length, 'both speech bursts must be in one utterance');
+});
+
+test('energy VAD forces a finalize past the max-utterance cap during continuous speech', () => {
+  const utterances = [];
+  const vad = createEnergyVad({ onSpeechStart: () => {}, onUtterance: (s) => utterances.push(s) });
+  for (let i = 0; i < 305; i++) vad.feed(tone(100, 0.5)); // 30.5s continuous, no pause
+  assert.strictEqual(utterances.length, 1, 'must not grow one buffer unboundedly on nonstop speech');
+});
+
+test('energy VAD flush() is a no-op when nothing is buffered', () => {
+  const utterances = [];
+  const vad = createEnergyVad({ onSpeechStart: () => {}, onUtterance: (s) => utterances.push(s) });
+  vad.flush();
+  assert.strictEqual(utterances.length, 0);
+});
+
+test('energy VAD reports isSpeaking correctly across an utterance lifecycle', () => {
+  const vad = createEnergyVad({ onSpeechStart: () => {}, onUtterance: () => {} });
+  assert.strictEqual(vad.isSpeaking, false);
+  vad.feed(tone(100, 0.5));
+  assert.strictEqual(vad.isSpeaking, true);
+  vad.flush();
+  assert.strictEqual(vad.isSpeaking, false);
+});

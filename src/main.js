@@ -7,7 +7,16 @@ const path = require('path');
 const readline = require('readline');
 
 const { startCapture } = require('./capture');
-const { createSTTEngine, assertModelPresent } = require('./stt');
+// Whisper (sttWhisper.js) is the default: the streaming Zipformer model
+// (stt.js) is small, English-only, and trained mostly on native-accent
+// speech -- it does badly on non-native accents (Indian English among
+// them). Whisper was trained on far more diverse, heavily-accented
+// multilingual audio and is meaningfully more accurate here, at the cost of
+// true word-by-word streaming (results arrive per-utterance, on a silence
+// gap, not live per-word). Set RCLI_MEET_STT_ENGINE=zipformer for the old
+// low-latency streaming behavior instead.
+const STT_ENGINE = (process.env.RCLI_MEET_STT_ENGINE || 'whisper').toLowerCase();
+const { createSTTEngine, assertModelPresent } = require(STT_ENGINE === 'zipformer' ? './stt' : './sttWhisper');
 const { createTranscript } = require('./transcript');
 const { createRetrieval } = require('./retrieval');
 const { createSummarizer } = require('./summary');
@@ -24,9 +33,11 @@ const {
   CONTEXT_TOKEN_BUDGET,
 } = require('./llm');
 
-const MODEL_DIR =
-  process.env.RCLI_MEET_STT_MODEL_DIR ||
-  path.join(__dirname, '..', 'models', 'sherpa-onnx-streaming-zipformer-en-2023-06-26');
+const DEFAULT_MODEL_DIR =
+  STT_ENGINE === 'zipformer'
+    ? path.join(__dirname, '..', 'models', 'sherpa-onnx-streaming-zipformer-en-2023-06-26')
+    : path.join(__dirname, '..', 'models', 'sherpa-onnx-whisper-small.en');
+const MODEL_DIR = process.env.RCLI_MEET_STT_MODEL_DIR || DEFAULT_MODEL_DIR;
 const RETRIEVAL_TOP_K = 5;
 const SOURCES = ['meeting', 'you'];
 const FILE_CHUNK_CHARS = 1500;
@@ -128,7 +139,7 @@ async function main() {
 
   console.log('[rcli-meet] loading streaming STT model...');
   const stt = createSTTEngine(MODEL_DIR);
-  console.log('[rcli-meet] STT ready.');
+  console.log(`[rcli-meet] STT ready (engine: ${STT_ENGINE}).`);
 
   const tts = opts.tts ? createTTS() : null;
   console.log(opts.tts ? '[rcli-meet] TTS ready -- answers will be spoken.' : '[rcli-meet] TTS disabled (--no-tts).');

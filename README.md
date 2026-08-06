@@ -49,12 +49,38 @@ helper:
 pip install soundcard
 ```
 
-Download a streaming Zipformer model (English) into `models/`:
+Download the STT model into `models/`. Whisper small.en is the default
+engine (see below for why):
+
+```
+curl -L -o models/whisper.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.en.tar.bz2
+tar -xjf models/whisper.tar.bz2 -C models/
+```
+
+Or for the streaming Zipformer (`RCLI_MEET_STT_ENGINE=zipformer`, see below):
 
 ```
 curl -L -o models/zipformer.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2
 tar -xjf models/zipformer.tar.bz2 -C models/
 ```
+
+### STT engines: Whisper (default) vs streaming Zipformer
+
+There are two interchangeable STT engines, `src/sttWhisper.js` and `src/stt.js`,
+selected by `RCLI_MEET_STT_ENGINE` (`whisper` or `zipformer`).
+
+**Whisper (default)** was trained on far more diverse, heavily-accented
+multilingual audio and is meaningfully more accurate on non-native English --
+Indian English among others -- than the streaming Zipformer model, which is
+small, English-only, and trained mostly on native-accent speech. The
+trade-off: no true word-by-word streaming. `sttWhisper.js` buffers audio with
+a lightweight energy-based VAD (`RCLI_MEET_VAD_THRESHOLD`,
+`RCLI_MEET_VAD_SILENCE_MS`) and decodes each utterance once it detects
+~700ms of trailing silence -- a "(listening)" indicator shows while you're
+mid-utterance, and the real transcription arrives on the pause.
+
+**Zipformer** streams real partial captions word-by-word with no pause
+required, at the cost of the accuracy described above.
 
 ### Environment variables
 
@@ -63,8 +89,11 @@ tar -xjf models/zipformer.tar.bz2 -C models/
 | `RCLI_MEET_SDK_DIST` | `D:/the_code/runanywhere/SDK/runanywhere-sdks-main/sdk/runanywhere-electron/dist` | Path to your `@runanywhere/electron` `dist/` build |
 | `RCLI_MEET_LLM_PATH` | `qwen2.5-3b` (catalog id, auto-downloads) | Any RunAnywhere LLM catalog id or local GGUF path |
 | `RCLI_MEET_EMBEDDER_ID` | `minilm` | RunAnywhere embedder catalog id |
-| `RCLI_MEET_PYTHON` | `python` | Python interpreter to run `capture_loopback.py` -- override if `python`/`py` on PATH resolves to the Windows Store alias stub instead of a real interpreter |
-| `RCLI_MEET_STT_MODEL_DIR` | `models/sherpa-onnx-streaming-zipformer-en-2023-06-26` | Streaming Zipformer model directory |
+| `RCLI_MEET_PYTHON` | `python` | Python interpreter to run `capture_audio.py`/`play_audio.py` -- override if `python`/`py` on PATH resolves to the Windows Store alias stub instead of a real interpreter |
+| `RCLI_MEET_STT_ENGINE` | `whisper` | `whisper` or `zipformer` -- see above |
+| `RCLI_MEET_STT_MODEL_DIR` | `models/sherpa-onnx-whisper-small.en` (or the zipformer dir, matching the engine) | STT model directory |
+| `RCLI_MEET_VAD_THRESHOLD` | `0.012` | Whisper engine only: energy level considered "speech" |
+| `RCLI_MEET_VAD_SILENCE_MS` | `700` | Whisper engine only: trailing silence before an utterance finalizes |
 | `RCLI_MEET_CONTEXT_TOKENS` | `1200` | Transcript tokens allowed into the prompt (see Context budget) |
 | `RCLI_MEET_ANSWER_TOKENS` | `400` | Token budget for the answer, including any reasoning block |
 | `RCLI_MEET_THINKING` | unset (off for Qwen) | Set to `on` to re-enable chain-of-thought (see below) |
@@ -164,9 +193,13 @@ ranking and its failure handling, and model-path validation.
 - **Use audio with clear speech and no music bed.** A music track in the
   loopback path produces confident nonsense captions, which then poison the
   answers.
-- Endpoint detection needs a trailing silence gap to finalize an utterance;
-  a question asked in the first ~1-1.5s after speech resumes (right after
-  the previous endpoint reset) may land before any partial has appeared yet.
+- Both STT engines need a trailing silence gap to finalize an utterance; a
+  question asked right as speech resumes (before that gap elapses) may land
+  before anything has finalized yet -- give it a beat after a pause.
+- Whisper (default) has no true partial captions -- "(listening)" shows
+  while you're mid-utterance, and the real text arrives on the pause. Use
+  `RCLI_MEET_STT_ENGINE=zipformer` if you want live word-by-word streaming
+  back, at a real cost to accuracy on non-native accents.
 - Chain-of-thought is suppressed on Qwen models (see above). On other
   reasoning models the `<think>` block is hidden but still consumes budget --
   if you see "used its whole budget reasoning", raise
