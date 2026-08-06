@@ -37,6 +37,10 @@ function createSummarizer({ llm, disableThinking = false, onError = () => {} }) 
     get summary() {
       return summary;
     },
+    /** Seed/replace the summary directly -- used when loading a saved session. */
+    setSummary(text) {
+      summary = text || '';
+    },
     get pendingCount() {
       return pending.length;
     },

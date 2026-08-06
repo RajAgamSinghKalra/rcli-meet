@@ -121,6 +121,23 @@ Captions that arrive while an answer is streaming are held back and printed
 after it -- repainting the caption line mid-answer emits terminal escape
 sequences that shred both.
 
+### Commands (typed or spoken, except stop)
+
+| Command | Typed | Spoken | Does |
+|---|---|---|---|
+| `start` / `record` | Yes | Yes | Begin a new session -- transcribes + stores both sources into `sessions/<date>_<active-window>/` |
+| `stop` | Yes | **No** | Stop the current session. Typed-only on purpose: "stop" is an ordinary word, and triggering on every mid-sentence "stop" you say while recording would be worse than requiring it be typed |
+| `save` | Yes | Yes | Write the current session's transcript, rolling summary, and metadata to disk |
+| `load` | Yes | Yes | Lists saved sessions; type the number to load one into context for Q&A |
+| `add <path>` | Yes | (paths aren't speakable) | Ingest a `.txt` file into the current session -- copied into its folder and made searchable immediately |
+| anything else | Yes | Yes | A question -- answered from the transcript/summary/files, spoken back unless `--no-tts` |
+
+Spoken commands only trigger when the ENTIRE utterance is just that word (e.g. you said only "start", not "let's start the meeting") -- avoids false triggers during normal conversation.
+
+**Answers are always spoken aloud** (`--no-tts` to disable) via an offline piper voice. While speaking, both audio streams are muted so the system doesn't hear and transcribe its own voice.
+
+**Before `start`**, mic input that isn't a command is treated as a spoken question (hands-free Q&A without an active recording). **After `start`**, mic and meeting audio are both stored as transcript instead.
+
 `src/quiet.js` is the recommended entry point (it's what `run.bat` uses): it
 runs `src/main.js` and filters the native addon's `[RAC]` log spam, which
 would otherwise bury the captions under ~50 lines per session. The addon logs

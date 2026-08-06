@@ -1,5 +1,6 @@
 node_modules/
 models/*/
 transcripts/*.log
+sessions/
 *.tar.bz2
 run.bat

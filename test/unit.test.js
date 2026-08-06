@@ -720,3 +720,95 @@ test('assertModelPresent passes when every file exists', () => {
   }
   assert.doesNotThrow(() => assertModelPresent(dir));
 });
+
+// --- command parsing (start/stop/save/load, typed and spoken) -------------
+
+const { parseCommand } = require('../src/commands');
+
+test('parseCommand recognizes start/save/load case-insensitively, with punctuation', () => {
+  assert.strictEqual(parseCommand('start'), 'start');
+  assert.strictEqual(parseCommand('Start.'), 'start');
+  assert.strictEqual(parseCommand('RECORD'), 'start');
+  assert.strictEqual(parseCommand('save'), 'save');
+  assert.strictEqual(parseCommand('load'), 'load');
+});
+
+test('parseCommand: stop requires allowStop (spoken utterances never stop the session)', () => {
+  assert.strictEqual(parseCommand('stop'), 'stop'); // default allowStop: true (typed)
+  assert.strictEqual(parseCommand('stop', { allowStop: false }), null); // spoken
+});
+
+test('parseCommand ignores ordinary sentences containing a command word', () => {
+  // "stop" mid-sentence must not trigger -- only an utterance that IS just the word.
+  assert.strictEqual(parseCommand('please stop doing that'), null);
+  assert.strictEqual(parseCommand('let us start the discussion'), null);
+});
+
+test('parseCommand strips a leading slash', () => {
+  assert.strictEqual(parseCommand('/start'), 'start');
+});
+
+test('parseCommand returns null for a real question', () => {
+  assert.strictEqual(parseCommand('what did they say the deadline was?'), null);
+});
+
+// --- session save/load ------------------------------------------------------
+
+const {
+  slugify,
+  newSessionDir,
+  saveSession,
+  addFileToSession,
+  listSessions,
+  loadSession,
+} = require('../src/session');
+
+test('slugify produces a filesystem-safe, bounded name', () => {
+  assert.strictEqual(slugify('Google Chrome - Meeting (Q3 Review)!!'), 'google-chrome-meeting-q3-review');
+  assert.strictEqual(slugify(''), 'session');
+});
+
+test('newSessionDir names the folder with a date and the app name', () => {
+  const dir = newSessionDir('/base', 'Zoom Meeting');
+  assert.match(path.basename(dir), /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}_zoom-meeting$/);
+});
+
+test('save then load round-trips the transcript, summary, and files', () => {
+  const base = tmpDir();
+  const dir = path.join(base, 'sess-1');
+  fs.mkdirSync(dir, { recursive: true });
+  const logPath = path.join(base, 'live.log');
+  fs.writeFileSync(logPath, '[00:00:01] [meeting] hello\n[00:00:02] [you] hi\n');
+
+  saveSession(dir, { transcriptLogPath: logPath, summary: 'A short summary.', appName: 'Zoom' });
+  addFileToSession(dir, (() => {
+    const f = path.join(base, 'notes.txt');
+    fs.writeFileSync(f, 'some notes');
+    return f;
+  })());
+
+  const loaded = loadSession(base, 'sess-1');
+  assert.ok(loaded.transcriptText.includes('hello'));
+  assert.strictEqual(loaded.summary, 'A short summary.');
+  assert.strictEqual(loaded.files.length, 1);
+  assert.strictEqual(loaded.files[0].text, 'some notes');
+
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
+  assert.strictEqual(meta.appName, 'Zoom');
+});
+
+test('listSessions returns saved names newest-first, empty when none exist', () => {
+  const base = tmpDir();
+  assert.deepStrictEqual(listSessions(base), []);
+  fs.mkdirSync(path.join(base, '2024-01-01_a'));
+  fs.mkdirSync(path.join(base, '2024-06-01_b'));
+  assert.deepStrictEqual(listSessions(base), ['2024-06-01_b', '2024-01-01_a']);
+});
+
+test('loadSession throws a clear error for an unknown session name', () => {
+  assert.throws(() => loadSession(tmpDir(), 'nope'), /no saved session named/);
+});
+
+test('addFileToSession rejects a nonexistent source file', () => {
+  assert.throws(() => addFileToSession(tmpDir(), '/no/such/file.txt'), /no such file/);
+});
