@@ -1,20 +1,13 @@
-// Streaming speech-to-text over the official sherpa-onnx package (prebuilt,
-// real incremental decoding -- not RunAnywhere's own batch-only STT).
-//
-// The model loads ONCE via createSTTEngine(); each audio source (meeting
-// loopback, your mic) gets its own independent createStream() -- separate
-// decode state over the same weights, so two simultaneous speakers don't
-// share (and corrupt) a single recognizer's endpoint/decode state.
+// Streaming Zipformer STT via native sherpa-onnx-node.
+// Fast word-by-word partials, but weaker on non-native (e.g. Indian) English
+// than Vulkan Whisper or SenseVoice -- kept for low-latency demos.
 const fs = require('fs');
 const path = require('path');
 const { EventEmitter } = require('events');
-const sherpa_onnx = require('sherpa-onnx');
+const sherpa_onnx = require('./sherpa');
 
 const SAMPLE_RATE = 16000;
 
-// Full precision, not int8: meaningfully more accurate (word-level errors,
-// not just noise) at a CPU cost this box has headroom for -- STT is CPU-only
-// regardless, and the GPU is already fully dedicated to the LLM.
 const MODEL_FILES = {
   encoder: 'encoder-epoch-99-avg-1-chunk-16-left-128.onnx',
   decoder: 'decoder-epoch-99-avg-1-chunk-16-left-128.onnx',
@@ -25,15 +18,8 @@ const MODEL_FILES = {
 const MODEL_URL =
   'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2';
 
-/**
- * Fail early with an actionable message. Without this, a missing model file
- * surfaces as an opaque native error (or an outright process abort) from
- * inside sherpa-onnx.
- */
 function assertModelPresent(modelDir) {
-  const missing = Object.values(MODEL_FILES).filter(
-    (f) => !fs.existsSync(path.join(modelDir, f))
-  );
+  const missing = Object.values(MODEL_FILES).filter((f) => !fs.existsSync(path.join(modelDir, f)));
   if (missing.length === 0) return;
 
   throw new Error(
@@ -45,11 +31,10 @@ function assertModelPresent(modelDir) {
   );
 }
 
-/** Load the streaming model once. Returns {createStream, close}. */
 function createSTTEngine(modelDir) {
   assertModelPresent(modelDir);
 
-  const recognizer = sherpa_onnx.createOnlineRecognizer({
+  const recognizer = new sherpa_onnx.OnlineRecognizer({
     modelConfig: {
       transducer: {
         encoder: path.join(modelDir, MODEL_FILES.encoder),
@@ -57,7 +42,7 @@ function createSTTEngine(modelDir) {
         joiner: path.join(modelDir, MODEL_FILES.joiner),
       },
       tokens: path.join(modelDir, MODEL_FILES.tokens),
-      numThreads: 2,
+      numThreads: Math.max(2, Math.min(4, require('os').cpus().length - 1 || 2)),
       provider: 'cpu',
       modelType: 'zipformer2',
       debug: 0,
@@ -73,7 +58,6 @@ function createSTTEngine(modelDir) {
   let engineClosed = false;
   const openStreams = new Set();
 
-  /** Independent decode state over the shared model. */
   function createStream() {
     if (engineClosed) throw new Error('createStream: STT engine is already closed');
 
@@ -84,10 +68,9 @@ function createSTTEngine(modelDir) {
 
     emitter.sampleRate = SAMPLE_RATE;
 
-    /** @param samples {Float32Array} mono, 16kHz, range [-1, 1] */
     emitter.feed = function feed(samples) {
       if (streamClosed || engineClosed) return;
-      stream.acceptWaveform(SAMPLE_RATE, samples);
+      stream.acceptWaveform({ samples, sampleRate: SAMPLE_RATE });
       while (recognizer.isReady(stream)) {
         recognizer.decode(stream);
       }
@@ -106,12 +89,15 @@ function createSTTEngine(modelDir) {
       }
     };
 
-    // Idempotent: freeing the same native handle twice can crash the process.
     emitter.close = function close() {
       if (streamClosed) return;
       streamClosed = true;
       openStreams.delete(emitter);
-      stream.free();
+    };
+    emitter.reset = function reset() {
+      if (streamClosed || engineClosed) return;
+      lastPartial = '';
+      recognizer.reset(stream);
     };
 
     openStreams.add(emitter);
@@ -120,12 +106,10 @@ function createSTTEngine(modelDir) {
 
   return {
     createStream,
-    /** Closes every open stream, then frees the shared model. Idempotent. */
     close() {
       if (engineClosed) return;
       engineClosed = true;
       for (const s of Array.from(openStreams)) s.close();
-      recognizer.free();
     },
   };
 }

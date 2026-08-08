@@ -622,8 +622,10 @@ test('summarizer and askQuestion share the same lock (never overlap)', async () 
 // --- capture source validation ---------------------------------------------
 
 test('startCapture rejects an unknown source before spawning anything', () => {
-  const { startCapture } = require('../src/capture');
+  const { startCapture, filterCaptureStderr } = require('../src/capture');
   assert.throws(() => startCapture('bogus', () => {}), /must be "loopback" or "mic"/);
+  assert.ok(!/discontinuity/i.test(filterCaptureStderr('data discontinuity in recording\nok\n')));
+  assert.match(filterCaptureStderr('on: Speakers\n'), /on: Speakers/);
 });
 
 // --- log-noise filter (quiet.js) ------------------------------------------
@@ -752,6 +754,22 @@ test('parseCommand returns null for a real question', () => {
   assert.strictEqual(parseCommand('what did they say the deadline was?'), null);
 });
 
+test('parseCommand accepts common ASR mishears of start', () => {
+  for (const w of ['Sharks.', 'Shark', 'stark', 'sstark', 'startstart', 'Started', 'start recording']) {
+    assert.strictEqual(parseCommand(w, { allowStop: false }), 'start', w);
+  }
+});
+
+test('parseCommand accepts fuzzy near-misses via edit distance', () => {
+  assert.strictEqual(parseCommand('strat', { allowStop: false }), 'start');
+  assert.strictEqual(parseCommand('saave', { allowStop: false }), 'save');
+});
+
+test('parseCommand does not treat sharky questions as start', () => {
+  assert.strictEqual(parseCommand('are there sharks in the ocean?', { allowStop: false }), null);
+  assert.strictEqual(parseCommand('tell me about sharks', { allowStop: false }), null);
+});
+
 // --- session save/load ------------------------------------------------------
 
 const {
@@ -815,7 +833,8 @@ test('addFileToSession rejects a nonexistent source file', () => {
 
 // --- energy VAD segmenter (sttWhisper.js) ----------------------------------
 
-const { createEnergyVad, SAMPLE_RATE: WHISPER_SAMPLE_RATE } = require('../src/sttWhisper');
+const { createEnergyVad, SAMPLE_RATE: WHISPER_SAMPLE_RATE } = require('../src/vadEnergy');
+const { scrubHallucination } = require('../src/sttVulkan');
 
 function tone(ms, amplitude) {
   return new Float32Array(Math.round((WHISPER_SAMPLE_RATE * ms) / 1000)).fill(amplitude);
@@ -879,4 +898,20 @@ test('energy VAD reports isSpeaking correctly across an utterance lifecycle', ()
   assert.strictEqual(vad.isSpeaking, true);
   vad.flush();
   assert.strictEqual(vad.isSpeaking, false);
+});
+
+// --- whisper hallucination scrub ------------------------------------------------
+
+test('scrubHallucination drops common Whisper silence hallucinations', () => {
+  assert.strictEqual(scrubHallucination('Thank you.'), '');
+  assert.strictEqual(scrubHallucination('Thanks for watching.'), '');
+  assert.strictEqual(scrubHallucination('Clear conversation.'), '');
+  assert.strictEqual(scrubHallucination('uh'), '');
+});
+
+test('scrubHallucination keeps real meeting speech', () => {
+  assert.strictEqual(
+    scrubHallucination('We will ship the build on Friday'),
+    'We will ship the build on Friday'
+  );
 });

@@ -10,9 +10,10 @@
   "scripts": {
     "start": "node src/quiet.js",
     "start:verbose": "node src/main.js",
+    "setup:stt-gpu": "powershell -ExecutionPolicy Bypass -File scripts/setup-stt-gpu.ps1",
     "test": "node --test test/unit.test.js"
   },
   "dependencies": {
-    "sherpa-onnx": "^1.12.11"
+    "sherpa-onnx-node": "^1.13.4"
   }
 }

@@ -1,6 +1,7 @@
-// Offline Whisper STT via native sherpa-onnx-node (NOT the WASM package).
-// Kept as a CPU fallback when Vulkan whisper.cpp isn't installed. Prefer
-// RCLI_MEET_STT_ENGINE=vulkan (default) for GPU on AMD/NVIDIA.
+// SenseVoice (FunASR) via native sherpa-onnx-node -- strong multilingual /
+// accented-English CPU fallback when Vulkan whisper.cpp isn't available.
+// Trained on far more diverse speech than the small English Zipformer, and
+// much faster than Whisper-small under sherpa.
 const fs = require('fs');
 const path = require('path');
 const { EventEmitter } = require('events');
@@ -8,24 +9,23 @@ const sherpa_onnx = require('./sherpa');
 const { createEnergyVad, SAMPLE_RATE } = require('./vadEnergy');
 
 const MODEL_FILES = {
-  encoder: 'small.en-encoder.int8.onnx',
-  decoder: 'small.en-decoder.int8.onnx',
-  tokens: 'small.en-tokens.txt',
+  model: 'model.int8.onnx',
+  tokens: 'tokens.txt',
 };
 
 const MODEL_URL =
-  'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.en.tar.bz2';
+  'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2';
 
 function assertModelPresent(modelDir) {
   const missing = Object.values(MODEL_FILES).filter((f) => !fs.existsSync(path.join(modelDir, f)));
   if (missing.length === 0) return;
   throw new Error(
-    `Whisper STT model files missing from:\n  ${modelDir}\n` +
+    `SenseVoice STT model files missing from:\n  ${modelDir}\n` +
       missing.map((f) => `  - ${f}`).join('\n') +
       `\n\nDownload with:\n` +
-      `  curl -L -o models/whisper.tar.bz2 ${MODEL_URL}\n` +
-      `  tar -xjf models/whisper.tar.bz2 -C models/\n` +
-      `\nOr (recommended) use GPU Whisper instead:\n` +
+      `  curl -L -o models/sense-voice.tar.bz2 ${MODEL_URL}\n` +
+      `  tar -xjf models/sense-voice.tar.bz2 -C models/\n` +
+      `\nOr (recommended) use GPU Whisper:\n` +
       `  powershell -ExecutionPolicy Bypass -File scripts/setup-stt-gpu.ps1`
   );
 }
@@ -35,11 +35,10 @@ function createSTTEngine(modelDir) {
 
   const recognizer = new sherpa_onnx.OfflineRecognizer({
     modelConfig: {
-      whisper: {
-        encoder: path.join(modelDir, MODEL_FILES.encoder),
-        decoder: path.join(modelDir, MODEL_FILES.decoder),
+      senseVoice: {
+        model: path.join(modelDir, MODEL_FILES.model),
         language: 'en',
-        task: 'transcribe',
+        useInverseTextNormalization: 1,
       },
       tokens: path.join(modelDir, MODEL_FILES.tokens),
       numThreads: Math.max(2, Math.min(6, require('os').cpus().length - 1 || 2)),
@@ -50,7 +49,6 @@ function createSTTEngine(modelDir) {
 
   let engineClosed = false;
   const openStreams = new Set();
-  // Serialize offline decodes so dual streams don't thrash the CPU recognizer.
   let decodeChain = Promise.resolve();
 
   function decodeAsync(samples) {
@@ -70,7 +68,6 @@ function createSTTEngine(modelDir) {
 
   function createStream() {
     if (engineClosed) throw new Error('createStream: STT engine is already closed');
-
     const emitter = new EventEmitter();
     let streamClosed = false;
 
@@ -116,10 +113,4 @@ function createSTTEngine(modelDir) {
   };
 }
 
-module.exports = {
-  createSTTEngine,
-  assertModelPresent,
-  createEnergyVad,
-  SAMPLE_RATE,
-  MODEL_FILES,
-};
+module.exports = { createSTTEngine, assertModelPresent, SAMPLE_RATE, MODEL_FILES };

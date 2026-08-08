@@ -5,20 +5,23 @@ said, while it's still being said. No UI, terminal only. Nothing leaves the
 machine -- audio never gets uploaded anywhere.
 
 Built on top of [RunAnywhere](https://github.com/RunanywhereAI)'s local
-inference engine (Vulkan-accelerated on AMD GPUs) and the official
-[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) streaming Zipformer for
-real incremental speech-to-text.
+inference engine (Vulkan-accelerated LLM on AMD GPUs) and
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) with Vulkan for
+GPU speech-to-text (same ggml stack as the LLM).
 
 ## How it works
 
 - **Audio capture**: WASAPI loopback (native to Windows -- no virtual audio
   cable needed) grabs whatever the default output device is currently
-  playing. A small Python helper (`capture_loopback.py`, using the
+  playing. A small Python helper (`capture_audio.py`, using the
   `soundcard` package) streams raw 16kHz mono float32 PCM to the Node
   process over stdout.
-- **Streaming STT**: the official `sherpa-onnx` npm package runs a streaming
-  Zipformer transducer model over that audio incrementally, emitting partial
-  captions as they're recognized and finalized segments on speech endpoints.
+- **STT (default: Vulkan Whisper)**: a long-lived GPU worker keeps
+  `large-v3-turbo` warm on Vulkan. While someone is speaking, the in-flight
+  utterance is re-decoded every ~1.6s and shown live as growing partial
+  captions (`… [meeting] words appear here`). After ~0.9s of silence a
+  higher-quality beam-search pass commits the final line. A 2–3s lag behind
+  live speech is expected and intentional.
 - **Rolling transcript**: every finalized segment is timestamped, kept in
   memory, and appended to a per-session log file (the ground-truth
   scrollback for every answer).
@@ -40,47 +43,54 @@ repo.
 
 ```
 npm install
+npm run setup:stt-gpu
 ```
+
+`setup:stt-gpu` downloads a Vulkan-enabled `whisper-server` (~17 MB) and
+`ggml-large-v3-turbo.bin` (~1.6 GB). That model is the accuracy/speed sweet
+spot for accented English on an RX 6800XT.
 
 Python 3 with the `soundcard` package is required for the loopback capture
 helper:
 
 ```
-pip install soundcard
+pip install soundcard numpy
 ```
 
-Download the STT model into `models/`. Whisper small.en is the default
-engine (see below for why):
+### STT engines
+
+Selected by `RCLI_MEET_STT_ENGINE`:
+
+| Engine | Default | Device | Notes |
+|---|---|---|---|
+| `vulkan` | **yes** | GPU (Vulkan / whisper.cpp) | `large-v3-turbo` -- best for Indian English |
+| `sensevoice` | | CPU (native sherpa) | FunASR SenseVoice -- strong accents, fast on CPU |
+| `whisper` | | CPU (native sherpa) | Whisper-small.en -- weaker than vulkan/turbo |
+| `zipformer` | | CPU (native sherpa) | Live word-by-word partials; weak on non-native accents |
+
+**Why Vulkan, not RunAnywhere `loadSTT`?** RunAnywhere's Electron STT uses
+sherpa-onnx Whisper with `provider="cpu"` hard-coded -- Vulkan in the SDK
+accelerates the LLM only. whisper.cpp with GGML_VULKAN is the matching GPU
+path for ASR on AMD.
+
+**Important:** do not use the npm package named `sherpa-onnx` (WASM). This
+project uses `sherpa-onnx-node` (native). The WASM package was the previous
+root cause of extremely slow, garbled captions.
+
+CPU fallback model downloads:
 
 ```
+# SenseVoice (recommended CPU fallback for Indian English)
+curl -L -o models/sense-voice.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2
+tar -xjf models/sense-voice.tar.bz2 -C models/
+
+# Or Whisper-small / Zipformer if you already have them
 curl -L -o models/whisper.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.en.tar.bz2
 tar -xjf models/whisper.tar.bz2 -C models/
 ```
 
-Or for the streaming Zipformer (`RCLI_MEET_STT_ENGINE=zipformer`, see below):
-
-```
-curl -L -o models/zipformer.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2
-tar -xjf models/zipformer.tar.bz2 -C models/
-```
-
-### STT engines: Whisper (default) vs streaming Zipformer
-
-There are two interchangeable STT engines, `src/sttWhisper.js` and `src/stt.js`,
-selected by `RCLI_MEET_STT_ENGINE` (`whisper` or `zipformer`).
-
-**Whisper (default)** was trained on far more diverse, heavily-accented
-multilingual audio and is meaningfully more accurate on non-native English --
-Indian English among others -- than the streaming Zipformer model, which is
-small, English-only, and trained mostly on native-accent speech. The
-trade-off: no true word-by-word streaming. `sttWhisper.js` buffers audio with
-a lightweight energy-based VAD (`RCLI_MEET_VAD_THRESHOLD`,
-`RCLI_MEET_VAD_SILENCE_MS`) and decodes each utterance once it detects
-~700ms of trailing silence -- a "(listening)" indicator shows while you're
-mid-utterance, and the real transcription arrives on the pause.
-
-**Zipformer** streams real partial captions word-by-word with no pause
-required, at the cost of the accuracy described above.
+Utterance engines show live growing partials while you speak (Vulkan refreshes
+about every 1.6s), then commit a final line after trailing silence.
 
 ### Environment variables
 
@@ -90,10 +100,14 @@ required, at the cost of the accuracy described above.
 | `RCLI_MEET_LLM_PATH` | `qwen2.5-3b` (catalog id, auto-downloads) | Any RunAnywhere LLM catalog id or local GGUF path |
 | `RCLI_MEET_EMBEDDER_ID` | `minilm` | RunAnywhere embedder catalog id |
 | `RCLI_MEET_PYTHON` | `python` | Python interpreter to run `capture_audio.py`/`play_audio.py` -- override if `python`/`py` on PATH resolves to the Windows Store alias stub instead of a real interpreter |
-| `RCLI_MEET_STT_ENGINE` | `whisper` | `whisper` or `zipformer` -- see above |
-| `RCLI_MEET_STT_MODEL_DIR` | `models/sherpa-onnx-whisper-small.en` (or the zipformer dir, matching the engine) | STT model directory |
-| `RCLI_MEET_VAD_THRESHOLD` | `0.012` | Whisper engine only: energy level considered "speech" |
-| `RCLI_MEET_VAD_SILENCE_MS` | `700` | Whisper engine only: trailing silence before an utterance finalizes |
+| `RCLI_MEET_STT_ENGINE` | `vulkan` | `vulkan` \| `sensevoice` \| `whisper` \| `zipformer` |
+| `RCLI_MEET_STT_MODEL_DIR` | engine-specific under `models/` | STT model path (file for vulkan, dir for others) |
+| `RCLI_MEET_WHISPER_BIN` | `bin/whisper` | Directory containing Vulkan `whisper-server.exe` |
+| `RCLI_MEET_WHISPER_MODEL` | `models/ggml-large-v3-turbo.bin` | ggml Whisper model for Vulkan engine |
+| `RCLI_MEET_WHISPER_PORT` | `8178` | Local whisper-server port |
+| `RCLI_MEET_PARTIAL_MS` | `1600` | How often to refresh live partial captions while speech continues |
+| `RCLI_MEET_VAD_THRESHOLD` | `0.012` | Energy level considered "speech" (non-zipformer) |
+| `RCLI_MEET_VAD_SILENCE_MS` | `900` | Trailing silence before a final caption is committed |
 | `RCLI_MEET_CONTEXT_TOKENS` | `1200` | Transcript tokens allowed into the prompt (see Context budget) |
 | `RCLI_MEET_ANSWER_TOKENS` | `400` | Token budget for the answer, including any reasoning block |
 | `RCLI_MEET_THINKING` | unset (off for Qwen) | Set to `on` to re-enable chain-of-thought (see below) |
@@ -163,9 +177,9 @@ sequences that shred both.
 
 Spoken commands only trigger when the ENTIRE utterance is just that word (e.g. you said only "start", not "let's start the meeting") -- avoids false triggers during normal conversation.
 
-**Answers are always spoken aloud** (`--no-tts` to disable) via an offline piper voice. While speaking, both audio streams are muted so the system doesn't hear and transcribe its own voice.
+**Answers are always spoken aloud** (`--no-tts` to disable) via an offline piper voice. While speaking, audio is muted so the system doesn't hear and transcribe its own voice.
 
-**Before `start`**, mic input that isn't a command is treated as a spoken question (hands-free Q&A without an active recording). **After `start`**, mic and meeting audio are both stored as transcript instead.
+**Before `start` / after `stop`**: voice chat mode — only your mic is listened to; meeting loopback is ignored. Speak a question and the answer is spoken back. **After `start`**: mic and meeting audio are both stored as transcript instead.
 
 `src/quiet.js` is the recommended entry point (it's what `run.bat` uses): it
 runs `src/main.js` and filters the native addon's `[RAC]` log spam, which
@@ -188,18 +202,16 @@ ranking and its failure handling, and model-path validation.
 
 ## Honest notes
 
-- Streaming STT is CPU-only (sherpa-onnx has no GPU runtime for this model
-  family) -- only the LLM leg is GPU-accelerated.
+- **LLM** uses RunAnywhere Vulkan. **STT** uses whisper.cpp Vulkan (not
+  RunAnywhere `loadSTT`, which is CPU-only today).
 - **Use audio with clear speech and no music bed.** A music track in the
   loopback path produces confident nonsense captions, which then poison the
   answers.
-- Both STT engines need a trailing silence gap to finalize an utterance; a
-  question asked right as speech resumes (before that gap elapses) may land
-  before anything has finalized yet -- give it a beat after a pause.
-- Whisper (default) has no true partial captions -- "(listening)" shows
-  while you're mid-utterance, and the real text arrives on the pause. Use
-  `RCLI_MEET_STT_ENGINE=zipformer` if you want live word-by-word streaming
-  back, at a real cost to accuracy on non-native accents.
+- Utterance engines need a trailing silence gap to finalize; give it a beat
+  after a pause before asking a question about what was just said.
+- Vulkan / SenseVoice / Whisper show "(listening)" mid-utterance; use
+  `RCLI_MEET_STT_ENGINE=zipformer` only if you need live word-by-word
+  partials and can accept worse accent accuracy.
 - Chain-of-thought is suppressed on Qwen models (see above). On other
   reasoning models the `<think>` block is hidden but still consumes budget --
   if you see "used its whole budget reasoning", raise
